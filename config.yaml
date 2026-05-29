@@ -1,0 +1,10 @@
+# ── Project-wide configuration ──────────────────────────────────────────────
+# This file is the single source of truth for all settings.
+# Change values here; never hardcode them inside Python files.
+
+symbol: "SPY"          # The instrument we're trading (S&P 500 ETF)
+start:  "2010-01-01"   # Start of historical window
+end:    "2024-12-31"   # End of historical window
+
+data_path: "data/cache"  # Where parquet files are stored on disk
+log_level: "INFO"        # DEBUG for verbose output, INFO for normal use

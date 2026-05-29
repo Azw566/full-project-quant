@@ -1,0 +1,159 @@
+════════════════════════════════════════════════════════════════
+  PHASE 0 — THE DATA LAYER
+  What we built, why we built it this way, and what to notice
+════════════════════════════════════════════════════════════════
+
+
+WHAT IS PHASE 0?
+────────────────
+Before any strategy, backtest, or live trading can exist, you need
+clean, reproducible price data. Phase 0 is that foundation.
+
+The done condition is simple:
+    Run the program twice. Both runs return exactly the same data.
+    The second run is fast (reads from disk, no network).
+
+That's it. Sounds trivial. It isn't — this discipline is what separates
+research you can trust from research you can't.
+
+
+THE FILES WE CREATED
+─────────────────────
+
+config.yaml
+    The single place where you change the symbol, date range, or
+    where data is stored. Every other file reads from here.
+    Rule: never hardcode "SPY" or "2010-01-01" inside Python files.
+
+data/loader.py
+    The heart of Phase 0. Contains one public function: get_bars().
+    This is the ONLY function the rest of the system will ever call
+    to get price data. The strategy doesn't know about yfinance —
+    it just calls get_bars() and gets back a DataFrame.
+
+    Why does this matter? In Phase 3, we'll add a live data feed.
+    Because everything goes through get_bars(), the strategy code
+    will not need to change at all. That's the North Star principle.
+
+data/cache/
+    Where the parquet files live. Each file is named:
+        SPY_2010-01-01_2024-12-31.parquet
+    The filename encodes the exact request, so different date ranges
+    don't overwrite each other. These files are gitignored — you
+    never commit raw data to version control.
+
+tests/test_loader.py
+    Eight tests that verify the data layer works correctly.
+    The most important one is test_reproducibility() — it proves
+    that two calls return identical DataFrames.
+
+main.py
+    The entry point. Run `python main.py` to see the whole thing work.
+
+
+KEY CONCEPTS TO UNDERSTAND
+───────────────────────────
+
+1. WHY PARQUET INSTEAD OF CSV?
+
+   CSV is text. Parquet is binary and columnar.
+
+   "Columnar" means the data is stored column-by-column on disk
+   instead of row-by-row. When you ask for just the 'close' column
+   (which is most of what strategies do), Parquet reads only that
+   column off disk. CSV has to read every row to find the values
+   in one column.
+
+   For 14 years of daily SPY data (~3500 rows), this doesn't matter
+   much. But when you move to minute bars (millions of rows), the
+   difference is 0.3 seconds vs 30 seconds. You will notice.
+
+   Parquet also stores the data types (float64, int64, datetime)
+   alongside the data. CSV stores everything as text — Python has
+   to guess and sometimes gets it wrong.
+
+
+2. WHY auto_adjust=True?
+
+   When a company does a stock split or pays a dividend, the raw
+   price history has artificial jumps that never happened in reality.
+
+   Example: Apple did a 4:1 split in August 2020.
+   - Raw price on Aug 27, 2020 (after split):  ~$125
+   - Raw price on Aug 26, 2020 (before split): ~$500
+
+   If you fed that raw data to a strategy, it would see a 75% drop
+   overnight and panic-sell. That never happened to a real investor.
+
+   auto_adjust=True rewrites the entire history so the pre-split
+   prices are divided by 4. The chart looks smooth and continuous.
+   Every column (open, high, low, close) gets adjusted, not just close.
+
+   The tradeoff: adjusted prices change retroactively whenever a new
+   dividend is paid. This is why we cache — the parquet file freezes
+   the data at the moment of download. Same inputs, same outputs.
+
+
+3. WHY HIDE YFINANCE BEHIND get_bars()?
+
+   Right now, yfinance is the only data source. But consider:
+   - In Phase 3, we'll add a live websocket feed from Alpaca.
+   - You might later want to add a second exchange, or use a paid
+     data provider with better historical data.
+
+   If you had written `yf.download(...)` directly in 10 places
+   across your codebase, you'd have to find and change all 10.
+
+   With get_bars() as the single entry point, you change ONE file.
+   Everything that calls get_bars() keeps working, untouched.
+
+   This is called "encapsulation" or "programming to an interface."
+   It's a basic software engineering principle, but in trading systems
+   it's especially important because data sources change constantly.
+
+
+4. WHAT IS A TRADING DAY?
+
+   SPY is a US stock. The US market is open Monday–Friday, except
+   for about 9 public holidays per year. So a "year" of daily bars
+   is roughly 252 rows, not 365.
+
+   When you see `bars.shape = (3,521, 5)` for 14 years of data,
+   that's 14 × 252 ≈ 3,528 rows. Makes sense.
+
+   This matters because: if you ever compute "annual return," you
+   annualise using 252, not 365. Using 365 would make your Sharpe
+   ratio slightly wrong — and quant interviewers will ask about this.
+
+
+QUESTIONS TO ASK YOURSELF
+───────────────────────────
+Before moving to Phase 1, make sure you can answer these:
+
+1. Why does the cache filename include start and end dates?
+   (Hint: what happens if you request a different date range?)
+
+2. What would happen if you deleted the parquet file and re-ran
+   main.py six months from now? Would the data be identical?
+   Should it be?
+
+3. The test `test_high_gte_low` checks that high >= low for every bar.
+   Can you think of a scenario where this might be violated in real data?
+   What would it mean if it was?
+
+4. Why do we drop NaN rows instead of filling them forward?
+   (Think about what forward-filling would mean for a strategy
+   that trades on daily closes.)
+
+
+WHAT'S NEXT — PHASE 1
+──────────────────────
+With clean, reproducible data in hand, Phase 1 will build the
+simplest possible backtest: a moving average crossover strategy,
+run vectorized (operating on the full price array at once).
+
+Phase 1 teaches: what metrics matter, what realistic costs look like,
+and how easy it is to accidentally cheat (look-ahead bias).
+
+It also gives us a baseline result that Phase 2 must reproduce
+exactly — proving the event-driven engine is correct.
