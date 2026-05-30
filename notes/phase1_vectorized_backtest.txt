@@ -1,0 +1,258 @@
+════════════════════════════════════════════════════════════════
+  PHASE 1 — VECTORIZED BACKTEST
+  What we built, why we built it this way, and what to notice
+════════════════════════════════════════════════════════════════
+
+
+WHAT IS PHASE 1?
+────────────────
+Phase 0 gave us clean, reproducible price data. Phase 1 asks:
+    "Given that data, what would have happened if we followed a rule?"
+
+We choose the simplest possible rule: a moving-average crossover.
+We run it across the full price history in one shot (vectorized).
+We measure realistic performance metrics including transaction costs.
+
+The "done" condition:
+    Sane numbers you can explain on a whiteboard — and that become
+    the ground truth for Phase 2 (the event-driven version must
+    reproduce these exactly).
+
+
+THE FILES WE CREATED
+─────────────────────
+
+strategy/ma_crossover.py
+    generate_signals(bars, fast, slow) → pd.Series
+
+    Takes a price DataFrame and two window sizes. Returns a signal:
+    1.0 = go long, 0.0 = stay flat, NaN = not enough history yet.
+
+    The rule: buy when the 50-day average is above the 200-day average.
+    Exit when it crosses back below.
+
+backtest/vectorized.py
+    run(bars, signals, fee_bps) → pd.DataFrame
+
+    The core backtesting logic. Applies the signal to the price data,
+    accounts for transaction costs, and returns a result DataFrame
+    with columns: position, market_return, gross_return, fee,
+    net_return, equity.
+
+backtest/metrics.py
+    compute_metrics(returns, positions) → dict
+
+    Computes the six standard performance metrics from a returns series.
+    Implemented from scratch so every formula is visible and testable.
+
+tests/test_vectorized.py and tests/test_metrics.py
+    Unit tests for both modules, including the look-ahead bias check.
+
+config.yaml (updated)
+    Added a `backtest:` section with fast_ma, slow_ma, fee_bps,
+    and train_ratio — all configurable without touching Python code.
+
+
+THE ALGORITHM, STEP BY STEP
+────────────────────────────
+
+1. LOAD DATA
+   bars = get_bars("SPY", "2010-01-01", "2024-12-31")
+   → ~3,521 rows of daily OHLCV
+
+2. GENERATE SIGNALS
+   fast_ma[t] = mean(close[t-49:t+1])   (50-day)
+   slow_ma[t] = mean(close[t-199:t+1])  (200-day)
+   signal[t]  = 1.0  if fast_ma[t] > slow_ma[t]
+              = 0.0  otherwise
+              = NaN  if t < 199  (warmup — not enough history)
+
+   The first 199 bars have NaN signals and are discarded before backtesting.
+
+3. WALK-FORWARD SPLIT (train_ratio=0.70)
+   in-sample  = first 70% of bars  (~2010–2020)
+   out-of-sample = last 30% of bars (~2020–2024)
+
+   We report metrics on BOTH, but the out-of-sample (OOS) number is the
+   honest one. In-sample numbers are always optimistic — the strategy
+   "saw" that data implicitly when we chose fast=50, slow=200.
+
+4. PREVENT LOOK-AHEAD BIAS
+   position[t] = signal[t-1]    ← THE CRITICAL LINE
+
+   We cannot act on today's closing price before today's close happens.
+   Shifting the signal by one bar means: the position for bar T was
+   decided at the close of bar T-1. This costs exactly one bar of lag
+   but prevents a form of cheating that is extremely easy to miss.
+
+5. COMPUTE RETURNS
+   market_return[t] = (close[t] - close[t-1]) / close[t-1]
+   gross_return[t]  = position[t] × market_return[t]
+
+   Example: position=1 on a day that goes +1.5% → gross_return=+1.5%
+            position=0 on a day that goes +1.5% → gross_return=0%
+
+6. APPLY FEES
+   fee_rate = fee_bps / 10_000     (10 bps → 0.0010)
+   trade[t] = |position[t] - position[t-1]|
+   fee[t]   = trade[t] × fee_rate
+
+   trade[t] = 1 when we enter or exit a full position, 0 when we hold.
+   So we pay fee_rate once to buy in and once to sell out.
+
+   10 bps round-trip (20 bps total) is realistic for a liquid ETF.
+   For crypto spot trading with taker fees of ~10 bps, this is optimistic.
+
+7. NET RETURN
+   net_return[t] = gross_return[t] - fee[t]
+
+8. EQUITY CURVE
+   equity[0] = 1.0
+   equity[t] = equity[t-1] × (1 + net_return[t])
+             = product(1 + net_return[0..t])
+
+9. METRICS
+   total_return = equity[-1] - 1
+
+   years        = N / 252
+   ann_return   = (1 + total_return)^(1/years) - 1
+
+   ann_vol      = std(net_return, ddof=1) × √252
+
+   sharpe       = ann_return / ann_vol         (rf = 0)
+
+   For each t: drawdown[t] = equity[t] / max(equity[0..t]) - 1
+   max_drawdown = min(drawdown)
+
+   daily_turnover = mean(|position[t] - position[t-1]|)
+   ann_turnover   = daily_turnover × 252
+
+
+KEY CONCEPTS TO UNDERSTAND
+───────────────────────────
+
+1. WHY VECTORIZED FIRST?
+
+   Vectorized = apply numpy/pandas operations to the full array at once.
+   It's fast, readable, and easy to reason about for research.
+
+   The downside: nothing structurally prevents you from accidentally
+   using future data. A single missing .shift(1) gives you perfect
+   foresight and a fantasy backtest. Vectorized code requires
+   discipline; the event-driven engine (Phase 2) removes the risk.
+
+2. WHY THIS STRATEGY?
+
+   The 50/200-day "golden cross" is possibly the most-cited trend rule
+   in existence. It's not a secret edge — it's a well-known baseline.
+
+   That's the point. For a developer portfolio, the signal is irrelevant.
+   What matters is that the system around it is correct. An interviewer
+   who sees you understand look-ahead bias, walk-forward splits, and
+   realistic fee modeling will not care that your strategy is simple.
+
+3. WHY SHIFT(1)?
+
+   Consider what happens without the shift:
+   - signal[t] is computed from close[t]
+   - position[t] = signal[t]   (no lag)
+   - return[t] = position[t] × (close[t] / close[t-1] - 1)
+
+   This means: on bar t, we look at today's close, decide to go long,
+   AND get paid for the price move into today's close — all
+   simultaneously. We're trading at a price we already know.
+
+   Real execution happens AFTER the close. By shifting: we decide
+   at close of t-1 and execute at close of t. That's at minimum a
+   one-bar delay, which is conservative (execution is usually at the
+   open of t, not close).
+
+4. WHY 10 BPS?
+
+   One basis point = 0.01%. Ten basis points = 0.10%.
+
+   For SPY on a US equity exchange, actual taker fees are typically
+   0–3 bps depending on venue and tier. 10 bps is conservative and
+   deliberately so — it includes a rough spread crossing.
+
+   For crypto spot, typical taker fees are 5–10 bps. Our 10 bps is
+   roughly right but ignores slippage (price impact of the order),
+   which matters more for larger positions and thinner markets.
+
+5. THE WALK-FORWARD DISCIPLINE
+
+   Quant finance term: "in-sample" is data your strategy parameters
+   were chosen on; "out-of-sample" is data it has never seen.
+
+   Even though we didn't optimize fast=50 and slow=200 (they're
+   conventional values), reporting only the in-sample result is
+   misleading. We always split:
+   - IN-SAMPLE: used for understanding and iteration.
+   - OOS: the honest number. What you'd report in an interview.
+
+   The danger of not splitting: you tune your strategy on 2010–2024,
+   report a Sharpe of 1.2, publish the "strategy." It promptly earns
+   0.0 going forward because you overfit to history.
+
+6. ANNUALIZATION CONVENTIONS
+
+   We use 252 trading days per year throughout:
+   - ann_vol   = daily_vol × √252
+   - ann_return = (1 + total_return)^(252/N) - 1
+   - ann_turnover = daily_turnover × 252
+
+   Using 365 would slightly underestimate annualized figures
+   (√365 > √252, so ann_vol would be 20% larger). Quant convention
+   is always 252 for daily equity/futures series.
+
+
+WHAT TO NOTICE IN THE OUTPUT
+──────────────────────────────
+When you run `python main.py`, look for:
+
+1. The in-sample Sharpe will typically be higher than OOS.
+   This is normal — it's not cheating, just the signal having
+   worked better historically than recently.
+
+2. The OOS Sharpe vs buy-and-hold Sharpe:
+   The 50/200 MA crossover often trails passive buy-and-hold in
+   strong bull markets because it exits and misses recoveries.
+
+3. Turnover of approximately 1–4x per year.
+   With 10 bps fees and ~2x turnover, annual fee drag is:
+       2 × 2 × 10 bps = 40 bps per year
+   Compared to 10–15% annual returns, this is relatively small.
+   But for a high-frequency strategy with 252x turnover and the same
+   fee, the drag is 252 × 2 × 10 bps = 50.4% per year — lethal.
+
+
+QUESTIONS TO ASK YOURSELF
+───────────────────────────
+Before moving to Phase 2, make sure you can answer these:
+
+1. What would happen to the Sharpe ratio if you set fee_bps=100?
+   At what fee level does the strategy become net-negative?
+
+2. What does it mean if in-sample Sharpe is 1.5 but OOS is 0.2?
+   Is that a problem with the strategy or the backtest?
+
+3. We use close-to-close returns. What look-ahead does that still
+   contain, even with shift(1)? (Hint: when does the close happen
+   relative to when you can place an order?)
+
+4. The equity curve is a product of (1 + net_return). Why
+   cumulative product and not cumulative sum? What would summing
+   the returns mean in practice?
+
+
+WHAT'S NEXT — PHASE 2
+──────────────────────
+Phase 2 replaces this vectorized loop with an event-driven engine.
+
+The event loop processes one bar at a time, in chronological order,
+and the strategy reacts to each event without the ability to look ahead.
+
+The critical test: Phase 2 must produce the SAME metrics as Phase 1
+(within floating-point tolerance). If it doesn't, there's a bug in
+either the event loop or the fee/position accounting — and finding it
+teaches you exactly how accounting errors hide in real systems.

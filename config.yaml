@@ -8,3 +8,10 @@ end:    "2024-12-31"   # End of historical window
 
 data_path: "data/cache"  # Where parquet files are stored on disk
 log_level: "INFO"        # DEBUG for verbose output, INFO for normal use
+
+# ── Phase 1 — Vectorized backtest ────────────────────────────────────────────
+backtest:
+  fast_ma:     50      # Fast moving average window (bars)
+  slow_ma:     200     # Slow moving average window (bars)
+  fee_bps:     10.0    # One-way transaction cost (10 bps = 0.10% per trade)
+  train_ratio: 0.7     # In-sample fraction; last (1 - ratio) is out-of-sample

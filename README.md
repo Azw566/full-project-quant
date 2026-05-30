@@ -4,11 +4,7 @@ An end-to-end systematic trading system built as a quant-developer learning proj
 The goal is to prove engineering correctness — reproducible data, event-driven backtesting,
 and a single strategy code path that runs unchanged in both backtest and live trading.
 
-## North Star
-
-> The same strategy code must run, unchanged, in both backtest and live trading.
-
-Every architectural decision in this project serves that principle.
+This project is bound to eveolve, testing multiple algorithms and implementations.
 
 ## Architecture
 
@@ -34,8 +30,8 @@ Every architectural decision in this project serves that principle.
 | Phase | Goal | Status |
 |-------|------|--------|
 | 0 | Data layer — reproducible OHLCV download and parquet cache | Done |
-| 1 | Vectorized backtest of a simple strategy with fees | Next |
-| 2 | Event-driven backtester (architectural core) | Planned |
+| 1 | Vectorized backtest of a simple strategy with fees | Done |
+| 2 | Event-driven backtester (architectural core) | Next |
 | 3 | Live paper data feed — backtest/live parity | Planned |
 | 4 | Testnet execution | Planned |
 | 5 | Risk, accounting, and correctness hardening | Planned |
@@ -45,16 +41,24 @@ Every architectural decision in this project serves that principle.
 
 ```
 fullproject/
-├── config.yaml              # symbol, date range, paths — edit here, not in code
-├── main.py                  # entry point
+├── config.yaml              # symbol, date range, backtest params — edit here, not in code
+├── main.py                  # entry point (runs Phase 0 + Phase 1)
 ├── requirements.txt
 ├── data/
 │   ├── loader.py            # get_bars() — the only public data interface
 │   └── cache/               # parquet files (gitignored)
+├── strategy/
+│   └── ma_crossover.py      # generate_signals() — 50/200-day MA crossover
+├── backtest/
+│   ├── vectorized.py        # run() — vectorized backtest engine
+│   └── metrics.py           # compute_metrics() — return, vol, Sharpe, drawdown, turnover
 ├── tests/
-│   └── test_loader.py       # data layer tests
+│   ├── test_loader.py       # data layer tests
+│   ├── test_vectorized.py   # backtest engine tests (including look-ahead check)
+│   └── test_metrics.py      # metrics unit tests
 └── notes/
-    └── phase0_data_layer.txt  # explanation of Phase 0 concepts
+    ├── phase0_data_layer.txt
+    └── phase1_vectorized_backtest.txt
 ```
 
 ## Quick Start
@@ -92,8 +96,3 @@ frozen, versioned dataset.
 
 **Transaction cost realism** — fees, spread, and slippage are first-class inputs,
 not footnotes. They change conclusions, not just magnitudes.
-
-## Learning Guide
-
-See `quant_system_project_guide.md` for the full roadmap, concept explanations,
-and the architectural reasoning behind every decision.

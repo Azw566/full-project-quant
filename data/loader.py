@@ -55,18 +55,18 @@ def get_bars(
     four OHLC columns, not just Close, so they're all consistent.
     """
 
-    # ── 1. Build the cache file path ────────────────────────────────────────
+    # Build the cache file path 
     # The filename captures all three dimensions of the request so different
     # (symbol, start, end) combinations never collide in the cache folder.
     cache_path = Path(cache_dir) / f"{symbol}_{start}_{end}.parquet"
 
-    # ── 2. Cache hit: return frozen data from disk ───────────────────────────
+    # Cache hit: return frozen data from disk 
     if cache_path.exists():
         logger.info("Cache hit  → %s", cache_path)
         df = pd.read_parquet(cache_path)
         return df
 
-    # ── 3. Cache miss: download from Yahoo Finance ───────────────────────────
+    # Cache miss: download from Yahoo Finance 
     logger.info("Cache miss → downloading %s (%s to %s)", symbol, start, end)
 
     raw = yf.download(
@@ -83,30 +83,20 @@ def get_bars(
             "Check the symbol name and date range."
         )
 
-    # ── 4. Normalise the DataFrame ───────────────────────────────────────────
-
-    # yfinance sometimes returns a MultiIndex column when only one ticker is
-    # requested (e.g. ('Close', 'SPY')). Flatten it to just the first level.
+    # Normalise the DataFrame
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
 
-    # Lowercase every column name so the rest of the codebase can write
-    # df['close'] instead of guessing whether it's 'Close' or 'CLOSE'.
     raw.columns = [c.lower() for c in raw.columns]
-
-    # Make sure the index is a proper DatetimeIndex and name it 'date'.
-    # Some yfinance versions return a plain Index — this normalises it.
     raw.index = pd.to_datetime(raw.index)
     raw.index.name = "date"
 
-    # Drop rows where any OHLCV value is NaN. These occasionally appear at
-    # the very start or end of a date range when the market wasn't open.
     n_before = len(raw)
     raw = raw.dropna()
     if len(raw) < n_before:
         logger.warning("Dropped %d NaN rows from %s", n_before - len(raw), symbol)
 
-    # ── 5. Save to parquet and return ────────────────────────────────────────
+    # Save to parquet and return 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     raw.to_parquet(cache_path)
     logger.info("Saved → %s  (%d rows)", cache_path, len(raw))
