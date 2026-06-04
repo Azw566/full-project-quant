@@ -1,0 +1,249 @@
+════════════════════════════════════════════════════════════════
+  PHASE 2 — EVENT-DRIVEN BACKTESTER
+  What we built, why we built it this way, and what to notice
+════════════════════════════════════════════════════════════════
+
+
+WHAT IS PHASE 2?
+────────────────
+Phase 1 proved that the 50/200-day MA crossover produces sane numbers.
+Phase 2 asks a harder question:
+    "Can we reproduce those exact numbers using a fundamentally different
+     architecture — one that structurally cannot look ahead?"
+
+The answer must be yes, and matching to floating-point tolerance is the
+proof. Any discrepancy is a bug, and the process of finding that bug is
+where the real learning happens.
+
+
+THE FILES WE CREATED
+─────────────────────
+
+backtest/event_driven.py
+    run(bars, signals, fee_bps) → pd.DataFrame
+
+    The event-driven engine. Iterates one bar at a time and routes
+    information through four event types, mirroring the architecture
+    diagram in README.md:
+
+        MarketEvent → SignalEvent → OrderEvent → FillEvent
+
+    The public signature is identical to backtest/vectorized.run() so
+    both engines are interchangeable at the call site.
+
+tests/test_event_driven.py
+    All tests from Phase 1 ported to the event-driven engine, plus
+    the parity check: eight scenarios where both engines must agree
+    within 1e-9 on every column.
+
+main.py (updated)
+    Added run_phase2(), which runs both engines side-by-side and
+    prints [PASS] or [FAIL] for the parity check.
+
+
+THE FOUR EVENTS
+────────────────
+
+1. MarketEvent
+   Emitted once per bar. Contains the bar's close price and the
+   close-to-close return vs the previous bar.
+
+   In live trading this is emitted by the exchange WebSocket when a
+   candle closes. In backtest it's emitted by iterating through the
+   cached parquet file. The handler code is the same either way.
+
+2. SignalEvent
+   Emitted by a lookup into the pre-shifted signals array. Contains
+   the target position: 1.0 = go long, 0.0 = go flat.
+
+   The pre-shift mirrors the vectorized engine's signals.shift(1):
+   the signal computed from close[T] cannot enter the portfolio until
+   bar T+1. This is still an explicit enforcement in Phase 2. In
+   Phase 3 (live feed), the lag becomes natural — the signal fires
+   after the bar closes, and the order fires on the next bar.
+
+3. OrderEvent
+   Emitted by the Portfolio in response to a SignalEvent. Contains
+   the delta: how much the position needs to change to reach the target.
+
+   In Phase 2 the delta is always 0 or ±1 (binary position). In
+   Phase 5 (risk hardening) the Portfolio will apply position limits
+   and sizing rules before emitting the OrderEvent.
+
+4. FillEvent
+   Emitted by the Broker in response to an OrderEvent. Contains the
+   actual filled delta and the fee charged.
+
+   In Phase 2 the Broker fills every order immediately at the closing
+   price with no slippage. In Phase 4 (testnet) the Broker component
+   is replaced by the real exchange client, and the FillEvent is
+   populated from the actual fill report. No other component changes.
+
+
+THE BACKTEST/LIVE PARITY DESIGN
+─────────────────────────────────
+The event architecture is not just about preventing look-ahead. It is
+the core of the system's North Star principle:
+
+    Same strategy code runs unchanged in backtest and live.
+
+In Phase 2 the data feed is a for-loop over parquet rows.
+In Phase 3 the same MarketEvent will be emitted by a WebSocket handler.
+The strategy, portfolio, and broker components below the engine never
+know the difference.
+
+This is the architectural payoff. Getting it right here means Phase 3
+and Phase 4 are plumbing changes — the logic does not move.
+
+
+HOW THE PARITY CHECK WORKS
+───────────────────────────
+Both engines receive the same bars and signals. The vectorized engine
+computes results with numpy array operations. The event-driven engine
+computes them one bar at a time in a Python loop.
+
+If the implementations are correct, every column in both result
+DataFrames should be identical to floating-point precision (< 1e-9
+absolute error). The comparison is done in run_phase2() in main.py and
+in test_parity_* tests in tests/test_event_driven.py.
+
+A mismatch tells you exactly WHERE the bug is (which column diverges)
+but not WHY. Debugging a parity failure is a valuable exercise:
+
+    1. Find the first row where the columns diverge.
+    2. Print both engines' intermediate values at that row
+       (position, market_return, fee, etc.).
+    3. Trace backward: which event handler produced the wrong value?
+
+Common failure modes:
+- Off-by-one in the initial position setup (first bar handling).
+- Fee computed before vs after position update.
+- Wrong direction of delta (target - current vs current - target).
+- Equity compounded incorrectly (multiplying before vs after fee).
+
+
+THE FIRST-BAR PROBLEM
+──────────────────────
+The most subtle part of Phase 2 is the first bar of bars_clean.
+
+In the vectorized engine, after dropping warmup rows and calling
+pct_change() and diff(), the first row of the result is NaN and gets
+dropped. So the result effectively starts at the SECOND bar of bars_clean.
+
+In the event-driven engine, we handle this by:
+1. On the first bar: set portfolio.position = positions[first_bar],
+   record prev_close, and continue (no row emitted).
+2. On the second bar and beyond: emit events, compute returns, record rows.
+
+The "silent" position assignment in step 1 matches what the vectorized
+engine assumes: at the start of bar 2, the position was already signal[0].
+No fee is charged for this initial assignment, which mirrors the vectorized
+engine not including a fee for a zero-diff first row.
+
+If this special case were handled wrong — say, portfolio.position stays at
+0.0 on the first bar — the fee on the first real row would be wrong for any
+case where signal[0] != 0.0.
+
+
+KEY CONCEPTS TO UNDERSTAND
+───────────────────────────
+
+1. WHY EVENT-DRIVEN IF VECTORIZED WORKS?
+
+   Correctness and extensibility. The vectorized engine produces right
+   numbers but has no guard against look-ahead beyond programmer discipline.
+   One missing .shift(1) anywhere in the signal chain breaks it silently.
+
+   The event loop makes look-ahead impossible by construction: a bar T's
+   close price literally does not exist in the system while the strategy
+   is processing bar T-1. There is nothing to accidentally read.
+
+2. WHY PRE-COMPUTE SIGNALS?
+
+   Because the strategy's generate_signals() function is vectorized — it
+   requires the full price history to compute moving averages correctly.
+   Pre-computing and then slicing bar-by-bar is the simplest way to reuse
+   the existing strategy code in an event loop.
+
+   A class-based strategy with on_bar(bar) would compute the MA online
+   using a running window (e.g., a deque of the last N closes). That
+   design is more "pure" event-driven but requires rewriting the strategy.
+   Phase 2 chooses the simpler path; Phase 3 will revisit this when the
+   live feed arrives and online computation becomes necessary.
+
+3. WHY DOES THE BROKER DO SO LITTLE?
+
+   By design. The broker's job in backtest is to accept orders and return
+   fills. No slippage, no partial fills, no latency. This is an
+   intentionally optimistic model — real execution is worse.
+
+   Keeping the broker thin now means Phase 4 (testnet) requires only
+   replacing _Broker with a real exchange client. The portfolio and
+   strategy components do not change.
+
+4. WHY FOUR EVENTS AND NOT TWO?
+
+   You could collapse this to "bar in → position out" with two events.
+   The four-event design reflects the real execution pipeline:
+
+       Market data (raw) → Strategy decision (signal) →
+       Risk-adjusted order (order) → Confirmed execution (fill)
+
+   Each boundary is a place where something real can fail, delay, or be
+   modified. Phase 5 (risk hardening) will add position limits at the
+   OrderEvent stage. Phase 4 adds async latency between OrderEvent and
+   FillEvent. The seams are already there.
+
+
+WHAT TO NOTICE IN THE OUTPUT
+──────────────────────────────
+When you run `python main.py`, Phase 2 should print:
+
+    [PASS] Event-driven matches vectorized within 1e-9 on all columns.
+           Rows compared : <N>
+
+If you see [FAIL], read the column name and max_diff. Then:
+    1. Add a print() inside the event loop to trace the first diverging row.
+    2. Compare the event handler's arithmetic against vectorized.py line by line.
+    3. Fix the bug and re-run.
+
+The Phase 1 and Phase 2 metric tables should print identical numbers
+(total return, Sharpe, drawdown, etc.) because they are computed from
+the same net_return series.
+
+
+QUESTIONS TO ASK YOURSELF
+───────────────────────────
+Before moving to Phase 3, make sure you can answer these:
+
+1. If you removed the pre-shift and instead shifted inside the event loop,
+   would the parity test still pass? Is there a way to introduce look-ahead
+   even in the event-driven architecture?
+
+2. In on_fill(), the position update happens BEFORE the return is computed:
+       self.position += event.delta
+       gross_return = self.position * market_return
+
+   What would happen if you computed gross_return BEFORE updating position?
+   Would the parity test catch this? (Try it.)
+
+3. The broker fills at close price on the same bar the signal was generated.
+   In reality you'd fill at the next bar's open. How would you modify the
+   event loop to enforce next-open execution, and would that break the
+   parity test?
+
+4. The _Portfolio and _Broker classes hold no shared state. What does that
+   mean for running two strategies simultaneously? What would need to change?
+
+
+WHAT'S NEXT — PHASE 3
+──────────────────────
+Phase 3 connects the event loop to a live paper data feed via WebSocket.
+
+The strategy and portfolio components are unchanged. The change is in
+the data source: instead of a for-loop over parquet rows, a WebSocket
+callback emits a MarketEvent every time a new candle closes on the exchange.
+
+The critical test of Phase 3: a 24-hour paper run should produce a metrics
+snapshot that is consistent (in direction and rough magnitude) with the
+backtest over the same recent period.

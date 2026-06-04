@@ -16,3 +16,6 @@ data/cache/*.parquet
 # OS
 .DS_Store
 Thumbs.db
+
+# Personal notes
+GUIDE.md

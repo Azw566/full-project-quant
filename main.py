@@ -16,7 +16,8 @@ import yaml
 
 from data.loader import get_bars
 from strategy.ma_crossover import generate_signals
-from backtest.vectorized import run as run_backtest
+from backtest.vectorized import run as run_vectorized
+from backtest.event_driven import run as run_event_driven
 from backtest.metrics import compute_metrics
 
 logging.basicConfig(
@@ -87,8 +88,8 @@ def run_phase1(cfg: dict, bars: pd.DataFrame) -> None:
     print(f"  OOS        : {oos_bars.index[0].date()}  ->  {oos_bars.index[-1].date()}  ({n_total - n_train} bars)")
 
     # ── Backtest both windows ──────────────────────────────────────────────
-    train_result = run_backtest(train_bars, train_signals, fee_bps=fee_bps)
-    oos_result   = run_backtest(oos_bars,   oos_signals,   fee_bps=fee_bps)
+    train_result = run_vectorized(train_bars, train_signals, fee_bps=fee_bps)
+    oos_result   = run_vectorized(oos_bars,   oos_signals,   fee_bps=fee_bps)
 
     # ── Metrics ────────────────────────────────────────────────────────────
     train_metrics = compute_metrics(train_result["net_return"], train_result["position"])
@@ -111,6 +112,44 @@ def run_phase1(cfg: dict, bars: pd.DataFrame) -> None:
     print("  (This is expected for a simple rule — the system design is the goal, not the alpha.)\n")
 
 
+def run_phase2(cfg: dict, bars: pd.DataFrame) -> None:
+    _print_section("PHASE 2 — Event-driven backtest (parity check vs Phase 1)")
+
+    bt_cfg  = cfg["backtest"]
+    fast    = bt_cfg["fast_ma"]
+    slow    = bt_cfg["slow_ma"]
+    fee_bps = bt_cfg["fee_bps"]
+
+    signals = generate_signals(bars, fast=fast, slow=slow)
+
+    vec_result = run_vectorized(bars, signals, fee_bps=fee_bps)
+    evt_result = run_event_driven(bars, signals, fee_bps=fee_bps)
+
+    # Compare every column of the two result DataFrames.
+    tol = 1e-9
+    mismatches = []
+    for col in vec_result.columns:
+        diff = (vec_result[col] - evt_result[col]).abs()
+        if diff.max() > tol:
+            mismatches.append(f"{col}: max_diff={diff.max():.2e}")
+
+    if mismatches:
+        print("\n  [FAIL] Event-driven results diverge from vectorized:")
+        for m in mismatches:
+            print(f"    {m}")
+        print("\n  This indicates an accounting bug — see notes/phase2_event_driven.txt.")
+    else:
+        print(f"\n  [PASS] Event-driven matches vectorized within {tol:.0e} on all columns.")
+        print(f"         Rows compared : {len(vec_result)}")
+
+    vec_metrics = compute_metrics(vec_result["net_return"], vec_result["position"])
+    evt_metrics = compute_metrics(evt_result["net_return"], evt_result["position"])
+
+    _print_metrics("Vectorized engine  (Phase 1 baseline)", vec_metrics)
+    _print_metrics("Event-driven engine  (Phase 2)", evt_metrics)
+    print()
+
+
 def main() -> None:
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
@@ -119,6 +158,7 @@ def main() -> None:
 
     run_phase0(cfg)
     run_phase1(cfg, bars)
+    run_phase2(cfg, bars)
 
 
 if __name__ == "__main__":
