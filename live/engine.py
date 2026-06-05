@@ -26,6 +26,7 @@ PUBLIC INTERFACE
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 
 import pandas as pd
@@ -81,6 +82,11 @@ class LiveEngine:
         self._pending_signal: float | None = None  # signal from the previous bar
         self._rows: list[dict] = []
 
+        # Gap detection: track last seen timestamp and derive expected interval
+        # from the first two consecutive bars.
+        self._prev_ts:       pd.Timestamp | None = None
+        self._bar_interval:  pd.Timedelta  | None = None
+
     # ── Initialization ─────────────────────────────────────────────────────────
 
     def initialize(self, bootstrap_bars: list[dict]) -> None:
@@ -129,6 +135,7 @@ class LiveEngine:
         # portfolio.position = prev_signal so first-row fee matches the backtest.
         self._portfolio.position = prev_signal if prev_signal is not None else self._pending_signal
         self._prev_close         = float(bootstrap_bars[-1]["close"])
+        self._prev_ts            = bootstrap_bars[-1]["timestamp"]
 
         logger.info(
             "Engine ready. MA%d=%.2f  MA%d=%.2f  prev_pos=%.0f  pending=%.0f",
@@ -156,6 +163,20 @@ class LiveEngine:
         """
         close: float        = float(bar["close"])
         ts:    pd.Timestamp = bar["timestamp"]
+
+        # Gap detection: warn if a disconnect caused missed candles.
+        # The expected interval is derived from the first two consecutive bars.
+        if self._prev_ts is not None:
+            if self._bar_interval is None:
+                self._bar_interval = ts - self._prev_ts
+            elif ts - self._prev_ts > self._bar_interval * 1.5:
+                missed = round((ts - self._prev_ts) / self._bar_interval) - 1
+                logger.warning(
+                    "GAP: %d bar(s) missed between %s and %s. "
+                    "MA window is stale — consider re-bootstrapping.",
+                    missed, self._prev_ts, ts,
+                )
+        self._prev_ts = ts
 
         self._window.append(close)
 
@@ -208,23 +229,24 @@ class LiveEngine:
         """
         Compute performance metrics from the session so far.
 
-        Passes the correct annualization factor for the candle interval to
-        compute_metrics() — hourly bars annualize differently than daily bars.
+        Uses the correct annualization factor for the candle interval:
+            1h → 8760 periods/year,  1d → 252,  etc.
         Returns None if fewer than 2 bars have been processed.
         """
         df = self.get_results()
         if len(df) < 2:
             return None
-        return compute_metrics(df["net_return"], df["position"])
+        periods = _PERIODS_PER_YEAR.get(interval, 252)
+        return compute_metrics(df["net_return"], df["position"], periods_per_year=periods)
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
     def _fast_ma(self) -> float:
         closes = list(self._window)
-        return sum(closes[-self._fast :]) / self._fast
+        return math.fsum(closes[-self._fast:]) / self._fast
 
     def _slow_ma(self) -> float:
-        return sum(self._window) / len(self._window)
+        return math.fsum(self._window) / len(self._window)
 
     def _compute_signal(self) -> float:
         return 1.0 if self._fast_ma() > self._slow_ma() else 0.0

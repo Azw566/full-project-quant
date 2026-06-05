@@ -15,6 +15,7 @@ import pandas as pd
 import yaml
 
 from data.loader import get_bars
+from feed.binance import get_historical_bars
 from strategy.ma_crossover import generate_signals
 from backtest.vectorized import run as run_vectorized
 from backtest.event_driven import run as run_event_driven
@@ -150,6 +151,70 @@ def run_phase2(cfg: dict, bars: pd.DataFrame) -> None:
     print()
 
 
+def run_btc_backtest(cfg: dict) -> None:
+    """
+    Run the same MA crossover strategy on BTCUSDT hourly data.
+
+    This is the missing link between the SPY backtest (Phases 1-2) and the
+    live system (Phase 3-4): it proves the strategy logic on the actual
+    instrument and timescale that the live system trades.
+
+    Data is downloaded from Binance REST and cached to data/cache/ so
+    subsequent runs are instant. Uses periods_per_year=8760 for correct
+    annualization of hourly bars.
+    """
+    _print_section("BTC HOURLY BACKTEST — live instrument validation")
+
+    feed_cfg = cfg["feed"]
+    bt_cfg   = cfg["backtest"]
+    btc_cfg  = cfg.get("btc_backtest", {})
+
+    symbol      = feed_cfg["symbol"]    # BTCUSDT
+    interval    = feed_cfg["interval"]  # 1h
+    start       = btc_cfg.get("start", "2022-01-01")
+    end         = btc_cfg.get("end",   "2024-12-31")
+    fast        = bt_cfg["fast_ma"]
+    slow        = bt_cfg["slow_ma"]
+    fee_bps     = bt_cfg["fee_bps"]
+    train_ratio = bt_cfg["train_ratio"]
+
+    cache_file = f"{cfg['data_path']}/{symbol}_{interval}.parquet"
+    bars       = get_historical_bars(symbol, interval, start, end, cache_path=cache_file)
+    signals    = generate_signals(bars, fast=fast, slow=slow)
+
+    n_total = len(bars)
+    n_train = int(n_total * train_ratio)
+
+    train_bars    = bars.iloc[:n_train]
+    oos_bars      = bars.iloc[n_train:]
+    train_signals = signals.iloc[:n_train]
+    oos_signals   = signals.iloc[n_train:]
+
+    print(f"\n  Instrument : {symbol} ({interval} candles)")
+    print(f"  Strategy   : {fast}/{slow}-bar MA crossover")
+    print(f"  Fee        : {fee_bps} bps per side")
+    print(f"  Period     : {bars.index[0]}  ->  {bars.index[-1]}  ({n_total} bars)")
+    print(f"  In-sample  : {train_bars.index[0]}  ->  {train_bars.index[-1]}")
+    print(f"  OOS        : {oos_bars.index[0]}  ->  {oos_bars.index[-1]}")
+
+    train_result = run_vectorized(train_bars, train_signals, fee_bps=fee_bps)
+    oos_result   = run_vectorized(oos_bars,   oos_signals,   fee_bps=fee_bps)
+
+    # 8760 periods/year for hourly bars — critical for correct Sharpe/vol/return.
+    T = 8_760
+    train_metrics = compute_metrics(train_result["net_return"], train_result["position"], periods_per_year=T)
+    oos_metrics   = compute_metrics(oos_result["net_return"],   oos_result["position"],   periods_per_year=T)
+
+    bh_return  = oos_bars["close"].pct_change().dropna()
+    bh_pos     = pd.Series(1.0, index=bh_return.index)
+    bh_metrics = compute_metrics(bh_return, bh_pos, periods_per_year=T)
+
+    _print_metrics("IN-SAMPLE metrics  (informational only)", train_metrics)
+    _print_metrics("OUT-OF-SAMPLE metrics  (the honest number)", oos_metrics)
+    _print_metrics("BUY-AND-HOLD benchmark  (OOS period)", bh_metrics)
+    print()
+
+
 def main() -> None:
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
@@ -159,6 +224,7 @@ def main() -> None:
     run_phase0(cfg)
     run_phase1(cfg, bars)
     run_phase2(cfg, bars)
+    run_btc_backtest(cfg)
 
 
 if __name__ == "__main__":

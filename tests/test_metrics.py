@@ -121,3 +121,59 @@ def test_empty_series_raises():
     pos = pd.Series([], dtype=float)
     with pytest.raises(ValueError, match="empty"):
         compute_metrics(returns, pos)
+
+
+def test_periods_per_year_changes_annualization():
+    """
+    The same returns series should produce different ann_vol / ann_return
+    depending on periods_per_year.
+
+    daily (252): ann_vol = daily_std × √252
+    hourly (8760): ann_vol = daily_std × √8760
+
+    The ratio should equal √(8760/252) ≈ 5.896.
+    """
+    n = 500
+    rng = np.random.default_rng(0)
+    values = rng.normal(0.001, 0.01, n).tolist()
+    returns, pos = _make_returns(values)
+
+    m_daily  = compute_metrics(returns, pos, periods_per_year=252)
+    m_hourly = compute_metrics(returns, pos, periods_per_year=8760)
+
+    ratio = m_hourly["ann_vol"] / m_daily["ann_vol"]
+    assert ratio == pytest.approx((8760 / 252) ** 0.5, rel=1e-6)
+
+
+def test_get_metrics_uses_interval_periods(tmp_path):
+    """
+    LiveEngine.get_metrics(interval) must use _PERIODS_PER_YEAR[interval],
+    not the hardcoded 252.  An hourly session's ann_vol must be √(8760/252) ≈ 5.9×
+    larger than a daily session's ann_vol computed from the same returns.
+    """
+    import pandas as pd
+    from live.engine import LiveEngine
+    from backtest.event_driven import _Broker, _Portfolio
+
+    fast, slow = 2, 4
+    engine = LiveEngine(_Portfolio(), _Broker(0.0), fast=fast, slow=slow)
+
+    # Noisy prices so returns have meaningful variance (uniform prices have ~0 vol)
+    rng    = np.random.default_rng(42)
+    prices = list(100.0 * np.cumprod(1 + rng.normal(0.002, 0.02, 30)))
+    idx    = pd.date_range("2024-01-01", periods=len(prices), freq="h")
+    bars   = [{"timestamp": ts, "open": p, "high": p, "low": p, "close": p, "volume": 1e6}
+              for ts, p in zip(idx, prices)]
+    for bar in bars:
+        engine.on_bar(bar)
+
+    m_hourly = engine.get_metrics(interval="1h")
+    m_daily  = engine.get_metrics(interval="1d")
+
+    assert m_hourly is not None
+    assert m_daily  is not None
+
+    # ann_vol = std × √T; ratio should be √(8760/252)
+    expected_ratio = (8760 / 252) ** 0.5
+    actual_ratio   = m_hourly["ann_vol"] / m_daily["ann_vol"]
+    assert actual_ratio == pytest.approx(expected_ratio, rel=1e-6)

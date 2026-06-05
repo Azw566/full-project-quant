@@ -31,6 +31,7 @@ import json
 import logging
 import urllib.request
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pandas as pd
 import websockets
@@ -124,6 +125,93 @@ class BinanceFeed:
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
+
+
+
+
+# ── Historical download (paginated REST) ──────────────────────────────────────
+
+def get_historical_bars(
+    symbol:     str,
+    interval:   str,
+    start:      str,
+    end:        str,
+    cache_path: str | None = None,
+) -> pd.DataFrame:
+    """
+    Fetch full historical OHLCV bars from Binance REST API with pagination.
+
+    Parameters
+    ----------
+    symbol     : Binance pair, e.g. "BTCUSDT"
+    interval   : Candle interval, e.g. "1h", "4h", "1d"
+    start, end : ISO date strings, e.g. "2022-01-01"
+    cache_path : If given, save/load a parquet cache at this path.
+                 Subsequent calls skip the download entirely.
+
+    Returns
+    -------
+    pd.DataFrame with DatetimeIndex (UTC, close-time) and columns:
+        open, high, low, close, volume
+    — same schema as data/loader.get_bars() so both feed directly into
+      generate_signals() and the backtest engines.
+
+    PAGINATION
+    ──────────
+    Binance's /api/v3/klines returns at most 1000 bars per request.
+    We loop, advancing startTime past the last batch's close_time until
+    we reach end. For 3 years of 1h data (~26,000 bars) this is ~27 calls.
+    """
+    if cache_path:
+        p = Path(cache_path)
+        if p.exists():
+            logger.info("Loading %s %s history from cache: %s", symbol, interval, cache_path)
+            return pd.read_parquet(p)
+
+    start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+    end_ms   = int(pd.Timestamp(end,   tz="UTC").timestamp() * 1000)
+    sym      = symbol.upper()
+
+    logger.info("Downloading %s %s history from %s to %s ...", sym, interval, start, end)
+
+    all_rows: list = []
+    cursor         = start_ms
+
+    while cursor < end_ms:
+        url = (
+            f"{_REST_BASE}/klines"
+            f"?symbol={sym}"
+            f"&interval={interval}"
+            f"&startTime={cursor}"
+            f"&endTime={end_ms}"
+            f"&limit=1000"
+        )
+        with urllib.request.urlopen(url, timeout=15) as resp:
+            batch: list = json.loads(resp.read())
+
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        cursor = int(batch[-1][6]) + 1   # advance past last close_time
+
+    if not all_rows:
+        raise ValueError(f"No data returned for {sym} {interval} {start}→{end}")
+
+    bars = [_parse_rest_kline(row) for row in all_rows]
+    df   = (
+        pd.DataFrame(bars)
+        .set_index("timestamp")[["open", "high", "low", "close", "volume"]]
+    )
+
+    logger.info("Downloaded %d bars for %s %s", len(df), sym, interval)
+
+    if cache_path:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(cache_path)
+        logger.info("Cached to %s", cache_path)
+
+    return df
 
 
 # ── Parsers ───────────────────────────────────────────────────────────────────

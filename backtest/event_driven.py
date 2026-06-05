@@ -151,23 +151,25 @@ def run(
     pd.DataFrame with columns: position, market_return, gross_return,
         fee, net_return, equity — identical schema to vectorized.run().
 
-    LOOK-AHEAD PREVENTION
-    ─────────────────────
-    Signals are pre-shifted by one bar before the loop begins, matching
-    the vectorized engine's shift(1). A signal computed from close[T] cannot
-    influence the position held on bar T — it enters the portfolio at bar T+1.
+    1-BAR SIGNAL LAG
+    ────────────────
+    The signal from bar T determines the position held on bar T+1.
+    This is applied via shift(1) — the same arithmetic as the vectorized engine.
 
-    This shift is the only place where future information could sneak in.
-    In a live system, the signal would arrive after the bar closes, making
-    the lag natural rather than enforced by a .shift(1) call.
+    What the event structure does guarantee: portfolio and broker logic cannot
+    accidentally access a future bar's price, because future bars haven't been
+    emitted yet. But the signal is still precomputed over the full history before
+    the loop begins. The truly online version — where signals are computed one
+    bar at a time with no future data at all — is live/engine.py (LiveEngine).
     """
-    # Pre-shift: same look-ahead prevention as the vectorized engine.
-    positions = signals.shift(1)
+    # Apply the 1-bar lag: lagged_signals[T] = signals[T-1].
+    # The position held on bar T was decided by the signal from bar T-1.
+    lagged_signals = signals.shift(1)
 
-    # Drop warmup rows where the shifted position is still NaN.
-    mask = positions.notna()
-    positions = positions[mask].astype(float)
-    bars_clean = bars.loc[mask]
+    # Drop warmup rows where the lagged signal is still NaN.
+    mask           = lagged_signals.notna()
+    lagged_signals = lagged_signals[mask].astype(float)
+    bars_clean     = bars.loc[mask]
 
     portfolio = _Portfolio()
     broker = _Broker(fee_bps)
@@ -179,11 +181,10 @@ def run(
         close = float(bar["close"])
 
         if prev_close is None:
-            # First bar: no previous close, so no market return can be computed.
-            # Set the initial portfolio position without charging a fee — there is
-            # no prior position to diff against, which mirrors the vectorized engine
+            # First bar: set the initial portfolio position without charging a fee.
+            # No prior position to diff against — mirrors the vectorized engine
             # dropping its first row (NaN from pct_change and diff).
-            portfolio.position = float(positions.loc[ts])
+            portfolio.position = float(lagged_signals.loc[ts])
             prev_close = close
             continue
 
@@ -192,7 +193,7 @@ def run(
         market_evt = MarketEvent(timestamp=ts, close=close, market_return=market_return)
 
         # ── SignalEvent ───────────────────────────────────────────────────────
-        signal_evt = SignalEvent(timestamp=ts, target_position=float(positions.loc[ts]))
+        signal_evt = SignalEvent(timestamp=ts, target_position=float(lagged_signals.loc[ts]))
 
         # ── OrderEvent ────────────────────────────────────────────────────────
         order_evt = portfolio.on_signal(signal_evt)

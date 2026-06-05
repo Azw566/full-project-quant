@@ -6,59 +6,67 @@ implementation is transparent and testable.
 
 PUBLIC INTERFACE
 ────────────────
-    compute_metrics(returns, positions) → dict
+    compute_metrics(returns, positions, periods_per_year=252) → dict
 """
 
 import numpy as np
 import pandas as pd
 
+# Default annualization factor. Pass periods_per_year explicitly when the
+# bar interval is not daily — e.g. 8760 for 1-hour bars, 252 for daily.
 TRADING_DAYS_PER_YEAR = 252
 
 
-def compute_metrics(returns: pd.Series, positions: pd.Series) -> dict:
+def compute_metrics(
+    returns: pd.Series,
+    positions: pd.Series,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> dict:
     """
-    Compute standard performance metrics from daily strategy returns.
+    Compute standard performance metrics from a strategy returns series.
 
     Parameters
     ----------
     returns : pd.Series
-        Daily net returns after fees. Must have no NaN values.
+        Per-bar net returns after fees. Must have no NaN values.
     positions : pd.Series
-        Daily position series (0.0 or 1.0). Used to compute turnover.
+        Per-bar position series (0.0 or 1.0). Used to compute turnover.
         Must be aligned to returns.
+    periods_per_year : int
+        Number of bars per year for annualization.
+        252  for daily bars (equity default)
+        8760 for 1-hour bars
+        2190 for 4-hour bars
+        Pass the correct value — using the wrong T produces wrong Sharpe/vol/return.
 
     Returns
     -------
     dict with keys:
         total_return   — cumulative return over the full period
         ann_return     — geometric annualized return
-        ann_vol        — annualized volatility (std of daily returns × √252)
+        ann_vol        — annualized volatility (std × √periods_per_year)
         sharpe         — Sharpe ratio (risk-free rate = 0)
         max_drawdown   — maximum peak-to-trough decline (negative number)
         ann_turnover   — annualized two-way turnover (position changes per year)
 
     METRIC DEFINITIONS
     ──────────────────
-    Ann return:   (1 + total_return)^(252/N) - 1
-        Geometric compounding: a 10% return over 2 years is √1.10 - 1 per year,
-        not 5%. This matches how investment managers report returns.
+    Ann return:   (1 + total_return)^(T/N) - 1   where T = periods_per_year
+        Geometric compounding: a 10% return over 2 years is √1.10 - 1 per year.
 
-    Ann vol:      std(daily_returns) × √252
-        Daily volatility scaled to annual. Uses sample std (ddof=1) by convention.
-        The √252 comes from the square-root-of-time rule for i.i.d. returns.
+    Ann vol:      std(returns, ddof=1) × √T
+        Uses sample std (Bessel's correction) by convention.
 
     Sharpe ratio: ann_return / ann_vol   (rf = 0)
-        Using rf=0 is standard for short-horizon crypto/equity backtests.
-        A Sharpe of 1.0 is considered good; >2.0 is excellent and often suspect.
+        rf=0 is standard for crypto backtests.
+        Note: this uses geometric ann_return over arithmetic ann_vol — standard
+        quant practice; differs slightly from arithmetic-mean / std × √T.
 
     Max drawdown: min( equity[t] / max(equity[0..t]) - 1 )
-        The worst peak-to-trough loss on the equity curve.
-        Always <= 0. A max drawdown of -0.20 means -20% from peak.
+        Always ≤ 0.
 
-    Ann turnover: mean(|Δposition|) × 252
-        How many times per year the full position flips on average.
-        Turnover=2 means the position fully turns over twice a year.
-        High turnover × fee costs = strategy death.
+    Ann turnover: mean(|Δposition|) × T
+        How many full round-trips per year on average.
     """
     n = len(returns)
     if n == 0:
@@ -68,19 +76,19 @@ def compute_metrics(returns: pd.Series, positions: pd.Series) -> dict:
 
     total_return = float(equity.iloc[-1] - 1.0)
 
-    years = n / TRADING_DAYS_PER_YEAR
+    years      = n / periods_per_year
     ann_return = float((1 + total_return) ** (1.0 / years) - 1)
 
-    ann_vol = float(returns.std(ddof=1) * np.sqrt(TRADING_DAYS_PER_YEAR))
+    ann_vol = float(returns.std(ddof=1) * np.sqrt(periods_per_year))
 
     sharpe = ann_return / ann_vol if ann_vol > 1e-12 else 0.0
 
-    rolling_max = equity.cummax()
-    drawdown = equity / rolling_max - 1.0
+    rolling_max  = equity.cummax()
+    drawdown     = equity / rolling_max - 1.0
     max_drawdown = float(drawdown.min())
 
     daily_turnover = positions.diff().abs().mean()
-    ann_turnover = float(daily_turnover * TRADING_DAYS_PER_YEAR)
+    ann_turnover   = float(daily_turnover * periods_per_year)
 
     return {
         "total_return": total_return,

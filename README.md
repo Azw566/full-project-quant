@@ -33,8 +33,8 @@ This project is bound to eveolve, testing multiple algorithms and implementation
 | 1 | Vectorized backtest of a simple strategy with fees | Done |
 | 2 | Event-driven backtester (architectural core) | Done |
 | 3 | Live paper data feed — backtest/live parity | Done |
-| 4 | Testnet execution | Next |
-| 5 | Risk, accounting, and correctness hardening | Planned |
+| 4 | Testnet execution — real market orders via Binance Spot Testnet | Done |
+| 5 | Risk, accounting, and correctness hardening | Next |
 | 6 | Portfolio polish | Planned |
 
 ## Project Structure
@@ -57,18 +57,22 @@ fullproject/
 │   └── binance.py           # BinanceFeed — REST bootstrap + WebSocket stream (Phase 3)
 ├── live/
 │   ├── engine.py            # LiveEngine — online event pipeline (Phase 3)
-│   └── runner.py            # entry point: python live/runner.py
+│   └── runner.py            # entry point: python live/runner.py [--testnet]
+├── execution/
+│   └── binance_broker.py    # TestnetBroker — real orders via Binance Spot Testnet (Phase 4)
 ├── tests/
 │   ├── test_loader.py       # data layer tests
 │   ├── test_vectorized.py   # backtest engine tests (including look-ahead check)
 │   ├── test_event_driven.py # event-driven engine tests (including parity check)
 │   ├── test_live_engine.py  # live engine tests (including backtest/live parity)
+│   ├── test_testnet_broker.py # testnet broker tests (mocked HTTP)
 │   └── test_metrics.py      # metrics unit tests
 └── notes/
     ├── phase0_data_layer.txt
     ├── phase1_vectorized_backtest.txt
     ├── phase2_event_driven.txt
-    └── phase3_live_feed.txt
+    ├── phase3_live_feed.txt
+    └── phase4_testnet.txt
 ```
 
 ## Quick Start

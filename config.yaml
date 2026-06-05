@@ -14,6 +14,20 @@ feed:
   symbol:   "BTCUSDT"    # Binance trading pair (no auth needed for market data)
   interval: "1h"         # candle interval: 1m 5m 15m 1h 4h 1d
 
+# ── BTC hourly backtest (validates the live instrument/timescale) ─────────────
+# Uses the same feed.symbol / feed.interval / backtest params.
+# Data is fetched from Binance REST API and cached to data/cache/.
+btc_backtest:
+  start: "2022-01-01"
+  end:   "2024-12-31"
+
+# ── Phase 4 — Testnet execution ──────────────────────────────────────────────
+# API key and secret come from environment variables, not this file.
+# Set BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET before using --testnet.
+# Get a free key pair at https://testnet.binance.vision/
+testnet:
+  order_qty: 0.001     # BTC quantity per trade (~$40-50 at typical prices)
+
 # ── Phase 1 — Vectorized backtest ────────────────────────────────────────────
 backtest:
   fast_ma:     50      # Fast moving average window (bars)

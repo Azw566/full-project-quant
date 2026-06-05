@@ -1,9 +1,9 @@
 """
-live/runner.py — Entry point for the live paper trading session.
+live/runner.py — Entry point for the live trading session.
 
 Usage (from the repo root):
-    python live/runner.py
-    python -m live.runner
+    python live/runner.py              # paper mode (simulated fills)
+    python live/runner.py --testnet    # testnet mode (real Binance testnet orders)
 
 What happens:
     1. Load config.yaml.
@@ -14,12 +14,15 @@ What happens:
        printing a line for every closed candle.
     5. On Ctrl+C: disconnect cleanly, print a session summary, and exit.
 
-This is a paper-only session — no real orders are placed.
-All position changes are simulated fills at the candle's closing price.
+Paper mode: all fills are simulated at the candle's closing price.
+Testnet mode: real market orders are submitted to the Binance Spot Testnet.
+    Requires BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET env vars.
+    Get a free key pair at https://testnet.binance.vision/
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -88,6 +91,14 @@ async def _stream(feed: BinanceFeed, engine: LiveEngine) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Live trading session")
+    parser.add_argument(
+        "--testnet",
+        action="store_true",
+        help="Submit real orders to the Binance Spot Testnet (requires API keys in env)",
+    )
+    args = parser.parse_args()
+
     cfg_path = Path(__file__).parent.parent / "config.yaml"
     with cfg_path.open() as f:
         cfg = yaml.safe_load(f)
@@ -103,15 +114,27 @@ def main() -> None:
 
     feed      = BinanceFeed(symbol, interval, warmup_bars=slow + 1)
     portfolio = _Portfolio()
-    broker    = _Broker(fee_bps)
-    engine    = LiveEngine(portfolio, broker, fast=fast, slow=slow)
+
+    if args.testnet:
+        from execution.binance_broker import TestnetBroker, load_credentials
+        api_key, api_secret = load_credentials()
+        order_qty = cfg.get("testnet", {}).get("order_qty", 0.001)
+        broker    = TestnetBroker(api_key, api_secret, symbol=symbol, order_qty=order_qty)
+        broker.sync_clock()
+        logger.info("Broker: Binance Spot Testnet  |  order_qty=%.4f BTC", order_qty)
+    else:
+        broker = _Broker(fee_bps)
+        logger.info("Broker: simulated paper  |  fee_bps=%.1f", fee_bps)
+
+    engine = LiveEngine(portfolio, broker, fast=fast, slow=slow)
 
     # Synchronous bootstrap — blocks for ~0.5 s, runs before event loop.
     bootstrap_bars = feed.bootstrap()
     engine.initialize(bootstrap_bars)
 
+    mode = "TESTNET" if args.testnet else "PAPER"
     logger.info("=" * 62)
-    logger.info("Live paper session  |  %s %s  |  Press Ctrl+C to stop", symbol, interval)
+    logger.info("Live %s session  |  %s %s  |  Press Ctrl+C to stop", mode, symbol, interval)
     logger.info("=" * 62)
 
     try:

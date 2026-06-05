@@ -1,0 +1,248 @@
+════════════════════════════════════════════════════════════════
+  PHASE 4 — TESTNET EXECUTION
+  What we built, why we built it this way, and what to notice
+════════════════════════════════════════════════════════════════
+
+
+WHAT IS PHASE 4?
+────────────────
+Phase 3 proved that the live feed connects and the event loop runs.
+Phase 4 asks the harder question:
+
+    "Does the system actually talk to an exchange?"
+
+We swap the simulated _Broker for a real one that submits market orders
+to the Binance Spot Testnet — a public sandbox that mirrors the mainnet
+API with fake balances and no real money at risk.
+
+The "done" condition:
+    python live/runner.py --testnet
+
+    Starts, bootstraps, and — when a trade signal fires — submits a real
+    signed MARKET order to testnet.binance.vision. The FillEvent is
+    populated from the exchange response (real fill price, real fee),
+    not from a formula.
+
+The key constraint:
+    _Portfolio, LiveEngine, events, and strategy are completely unchanged.
+    Only the broker changes. This is the North Star principle validated:
+    you can swap the execution backend without touching trading logic.
+
+
+THE FILES WE CREATED
+─────────────────────
+
+execution/__init__.py
+    Empty module marker.
+
+execution/binance_broker.py
+    TestnetBroker(api_key, api_secret, symbol, order_qty)
+
+    Same on_order(OrderEvent) → FillEvent interface as backtest._Broker.
+    Places signed MARKET orders via REST when delta != 0.
+
+    load_credentials()
+        Reads BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET
+        from environment variables. Raises ValueError at startup if absent
+        so the error surfaces before the first order fires, not mid-session.
+
+    _sign(params, secret)
+        HMAC-SHA256 over the URL-encoded parameter string — required for
+        all Binance signed endpoints.
+
+tests/test_testnet_broker.py
+    19 tests covering:
+    • delta=0 → no HTTP call, FillEvent fee=0
+    • BUY/SELL order sides and fee computation
+    • non-FILLED status → RuntimeError
+    • _extract_fee with BTC and USDT commissions, multiple fills, empty fills
+    • _sign determinism and HMAC correctness
+    • load_credentials error cases
+
+
+HOW TO RUN
+───────────
+1. Get a free API key pair:
+       Go to https://testnet.binance.vision/ → log in with GitHub → Generate HMAC key
+
+2. Export your credentials (do NOT put them in config.yaml or git):
+       # Windows PowerShell
+       $env:BINANCE_TESTNET_API_KEY    = "your_key_here"
+       $env:BINANCE_TESTNET_API_SECRET = "your_secret_here"
+
+       # Bash / WSL
+       export BINANCE_TESTNET_API_KEY="your_key_here"
+       export BINANCE_TESTNET_API_SECRET="your_secret_here"
+
+3. Start the session:
+       python live/runner.py --testnet
+
+4. What you see:
+   - "Broker: Binance Spot Testnet  |  order_qty=0.0010 BTC"
+   - Same bar-by-bar log as paper mode
+   - When a trade fires: "[TRADE  fee=0.0967%]" — the real Binance fee
+   - The fee is ~0.10% (10 bps) — the testnet default, matching config
+
+5. Without --testnet, the session runs in paper mode (simulated fills).
+   Paper mode is the default and requires no credentials.
+
+
+THE BINANCE SPOT TESTNET
+─────────────────────────
+URL: https://testnet.binance.vision
+    Same API as mainnet (api.binance.com) — same endpoints, same JSON format.
+    Funded with fake balances (the testnet resets periodically).
+    No account creation required beyond GitHub OAuth for the API key.
+
+KEY DIFFERENCES FROM MAINNET
+    • Testnet has lower liquidity — market orders still fill instantly for
+      small quantities like 0.001 BTC.
+    • Testnet may have slightly different fee rates or account limits.
+    • Testnet resets periodically — balances disappear, but our API keys
+      survive as long as we regenerate them if needed.
+
+The Binance testnet is the right sandbox for Phase 4: free, public,
+real API calls, zero financial risk.
+
+
+THE SIGNING PROTOCOL
+─────────────────────
+Binance's "signed" endpoints (order placement, account queries) require
+an HMAC-SHA256 signature over the query string.
+
+Steps:
+1. Build the parameter dict: symbol, side, type, quantity, timestamp.
+2. URL-encode the dict: "symbol=BTCUSDT&side=BUY&type=MARKET&quantity=0.001&timestamp=1700000000000"
+3. HMAC-SHA256 with your api_secret as key.
+4. Append &signature=<hex_digest> to the request params.
+5. Include X-MBX-APIKEY: <api_key> as an HTTP header.
+
+The timestamp must be within 5 seconds of the server clock. We use
+time.time() * 1000 converted to integer milliseconds.
+
+Why HMAC and not a simple API key?
+    A header-only API key can be stolen from HTTP logs or network sniffers.
+    The HMAC signature binds the key to the exact request body and timestamp.
+    A replayed request (same params, same signature) will be rejected because
+    the timestamp will have expired (>5 seconds old).
+
+
+ORDER SIZE AND THE POSITION MODEL
+───────────────────────────────────
+Our strategy produces binary positions: 0.0 (flat) or 1.0 (long). The
+delta at a trade event is always ±1.0.
+
+On a real exchange, you trade in actual asset quantities. We map:
+    delta =  1.0 → BUY  order_qty BTC
+    delta = -1.0 → SELL order_qty BTC
+    delta =  0.0 → no order
+
+order_qty (default: 0.001 BTC) is in config.yaml under testnet.order_qty.
+At $40,000–$50,000/BTC, 0.001 BTC is roughly $40–$50 per trade.
+
+We use quantity (fixed BTC amount) rather than quoteOrderQty (fixed USDT
+amount) because quoteOrderQty is only supported for the BUY side on Binance
+spot. Using a fixed BTC quantity works for both BUY and SELL.
+
+FEE NORMALIZATION
+    Binance reports commission in the fill response:
+        BUY orders:  commission in BTC  (0.001 BTC fee on a 1 BTC purchase)
+        SELL orders: commission in USDT (0.1 USDT fee on a 100 USDT sale)
+
+    We convert everything to USDT and compute:
+        fee_fraction = total_commission_usdt / total_trade_value_usdt
+
+    For a 10 bps fill: commission = 0.001 BTC at 40,000 USDT/BTC = 0.04 USDT
+                       trade value = 0.001 BTC * 40,000 = 40 USDT
+                       fee_fraction = 0.04 / 40 = 0.001 ✓
+
+    This matches the simulated broker's fee = abs(delta) * fee_rate,
+    so the portfolio accounting is identical in both modes.
+
+
+WHY market orders?
+───────────────────
+A market order fills at whatever price is available immediately. For a
+paper/testnet system, this is the right choice:
+    • Guaranteed execution — no risk of the order sitting unfilled.
+    • No price uncertainty — the fill is immediate.
+    • Simple — no need to handle partial fills, cancellations, or resting orders.
+
+A production system would care about market impact and might use limit
+orders or TWAP execution. Phase 5 will introduce slippage estimation.
+
+
+WHAT WE DELIBERATELY DID NOT CHANGE
+─────────────────────────────────────
+    • LiveEngine.on_bar()        — unchanged
+    • _Portfolio                 — unchanged
+    • MarketEvent / SignalEvent / OrderEvent / FillEvent — unchanged
+    • generate_signals()         — unchanged
+    • BinanceFeed (market data)  — unchanged
+
+Only the broker changed. This is the entire point of the layered event
+architecture: execution is isolated from strategy and portfolio logic.
+
+An interviewer looking at this code can immediately see that swapping
+from a simulated broker to a real one required:
+    1. One new file (execution/binance_broker.py)
+    2. One flag in the runner (--testnet)
+    3. Zero changes to any business logic
+
+That is the North Star principle demonstrated in practice.
+
+
+QUESTIONS TO ASK YOURSELF
+───────────────────────────
+Before moving to Phase 5:
+
+1. The testnet broker's on_order() blocks the asyncio event loop while
+   the HTTP call runs (~100-500 ms). For a 1-hour candle strategy, this
+   is harmless. At what candle interval would this become a problem, and
+   what would you do to fix it?
+   (Hint: aiohttp / httpx[async] + making on_bar() async)
+
+2. The timestamp in the signed request must be within 5 seconds of the
+   Binance server's clock. What happens if the machine's clock drifts?
+   How would you detect and handle this?
+   (Hint: /api/v3/time endpoint returns server time for sync)
+
+3. Our broker raises RuntimeError if the order is not FILLED. What are
+   the other possible statuses, and which ones would warrant a retry vs.
+   an immediate halt?
+   (Binance statuses: NEW, PARTIALLY_FILLED, FILLED, CANCELED, REJECTED, EXPIRED)
+
+4. We use a fixed order_qty (0.001 BTC). If BTC doubles in price, the
+   notional exposure also doubles. How would you keep notional exposure
+   constant across varying price levels?
+   (Hint: quoteOrderQty for BUY, computed quantity for SELL)
+
+5. The parity tests (test_live_engine.py) use the simulated broker. They
+   verify that LiveEngine + _Broker matches the backtest. They do NOT
+   verify that LiveEngine + TestnetBroker matches anything — because real
+   fills vary with market conditions. What is the right test strategy for
+   TestnetBroker?
+   (Hint: mock the HTTP layer, verify the delta/fee math, acceptance-test
+    the API signature against a known Binance test vector)
+
+
+WHAT'S NEXT — PHASE 5
+──────────────────────
+Phase 5 hardens the system against real-world failure modes:
+
+    • Gap detection: if the WebSocket misses candles during a disconnect,
+      detect the gap and decide whether to re-bootstrap or hold position.
+
+    • Slippage modeling: the simulated broker assumes zero slippage. Add
+      a configurable slippage estimate to the event-driven backtest so
+      the backtest is pessimistic enough to be meaningful.
+
+    • Position sizing: the binary 0/1 position model is a simplification.
+      Phase 5 might introduce fractional positions or Kelly-based sizing.
+
+    • Walk-forward validation: the backtests so far use the full history.
+      Phase 5 adds a proper IS/OOS split and rolling walk-forward to
+      estimate out-of-sample performance without lookahead.
+
+    • Logging and alerting: structured JSON logs, error rate monitoring,
+      PnL watermarks for auto-shutdown if drawdown exceeds a threshold.
