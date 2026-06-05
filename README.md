@@ -32,8 +32,8 @@ This project is bound to eveolve, testing multiple algorithms and implementation
 | 0 | Data layer — reproducible OHLCV download and parquet cache | Done |
 | 1 | Vectorized backtest of a simple strategy with fees | Done |
 | 2 | Event-driven backtester (architectural core) | Done |
-| 3 | Live paper data feed — backtest/live parity | Next |
-| 4 | Testnet execution | Planned |
+| 3 | Live paper data feed — backtest/live parity | Done |
+| 4 | Testnet execution | Next |
 | 5 | Risk, accounting, and correctness hardening | Planned |
 | 6 | Portfolio polish | Planned |
 
@@ -53,15 +53,22 @@ fullproject/
 │   ├── vectorized.py        # run() — vectorized backtest engine (Phase 1)
 │   ├── event_driven.py      # run() — event-driven backtest engine (Phase 2)
 │   └── metrics.py           # compute_metrics() — return, vol, Sharpe, drawdown, turnover
+├── feed/
+│   └── binance.py           # BinanceFeed — REST bootstrap + WebSocket stream (Phase 3)
+├── live/
+│   ├── engine.py            # LiveEngine — online event pipeline (Phase 3)
+│   └── runner.py            # entry point: python live/runner.py
 ├── tests/
 │   ├── test_loader.py       # data layer tests
 │   ├── test_vectorized.py   # backtest engine tests (including look-ahead check)
 │   ├── test_event_driven.py # event-driven engine tests (including parity check)
+│   ├── test_live_engine.py  # live engine tests (including backtest/live parity)
 │   └── test_metrics.py      # metrics unit tests
 └── notes/
     ├── phase0_data_layer.txt
     ├── phase1_vectorized_backtest.txt
-    └── phase2_event_driven.txt
+    ├── phase2_event_driven.txt
+    └── phase3_live_feed.txt
 ```
 
 ## Quick Start

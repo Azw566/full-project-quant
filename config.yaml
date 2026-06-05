@@ -9,6 +9,11 @@ end:    "2024-12-31"   # End of historical window
 data_path: "data/cache"  # Where parquet files are stored on disk
 log_level: "INFO"        # DEBUG for verbose output, INFO for normal use
 
+# ── Phase 3 — Live paper feed ─────────────────────────────────────────────────
+feed:
+  symbol:   "BTCUSDT"    # Binance trading pair (no auth needed for market data)
+  interval: "1h"         # candle interval: 1m 5m 15m 1h 4h 1d
+
 # ── Phase 1 — Vectorized backtest ────────────────────────────────────────────
 backtest:
   fast_ma:     50      # Fast moving average window (bars)

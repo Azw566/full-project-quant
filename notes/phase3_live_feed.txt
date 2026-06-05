@@ -1,0 +1,239 @@
+════════════════════════════════════════════════════════════════
+  PHASE 3 — LIVE PAPER FEED
+  What we built, why we built it this way, and what to notice
+════════════════════════════════════════════════════════════════
+
+
+WHAT IS PHASE 3?
+────────────────
+Phases 1 and 2 proved the backtest machinery is correct. Phase 3 asks:
+
+    "Does the same event pipeline actually run on real market data?"
+
+We connect the Phase 2 event loop to a live Binance WebSocket feed for
+BTCUSDT 1-hour candles. The strategy, portfolio, and broker components
+are imported unchanged from Phase 2. Only the data source changes.
+
+The "done" condition:
+    python live/runner.py starts, bootstraps historical bars, and prints
+    a live bar line every hour — indefinitely, until Ctrl+C.
+
+    The session summary on exit shows performance metrics that are
+    directionally consistent with the backtest over the same period.
+
+
+THE FILES WE CREATED
+─────────────────────
+
+feed/binance.py
+    BinanceFeed(symbol, interval, warmup_bars)
+
+    Two responsibilities:
+    • bootstrap() — synchronous REST call to fetch the last N closed candles
+      before the event loop starts. Runs once, provides historical context.
+    • stream()    — async generator that yields one bar dict per closed candle
+      from the live WebSocket. Reconnects automatically on disconnect.
+
+    No API key required — Binance's market-data endpoints are public.
+
+live/engine.py
+    LiveEngine(portfolio, broker, fast, slow)
+
+    Drives the four-event pipeline one bar at a time using a rolling deque
+    of the last `slow` closes to compute the MA crossover signal online.
+
+    Imports _Portfolio and _Broker from backtest/event_driven.py — the
+    same objects, unchanged. This is the North Star principle made concrete.
+
+live/runner.py
+    Entry point: python live/runner.py
+
+    Orchestrates bootstrap → initialize → stream loop → Ctrl+C summary.
+
+tests/test_live_engine.py (updated)
+    17 tests including 7 parity cases that prove LiveEngine == event_driven
+    on identical price series with generate_signals().
+
+
+WHY BINANCE / BTCUSDT / 1-HOUR CANDLES?
+─────────────────────────────────────────
+Binance is the world's most liquid crypto exchange and provides a clean,
+free WebSocket API for market data. No account required.
+
+BTCUSDT is the most liquid spot pair — tight spreads, 24/7 trading, deep
+order book. Daily volume is typically $10–30 billion.
+
+1-hour candles are the practical sweet spot for testing the live system:
+• Daily candles close once per 24 hours — you would wait days to see the
+  loop work. Impractical for development.
+• 1-minute candles close 1,440 times per day. With a 200-bar MA, warmup
+  is only ~3 hours, but the noise is high and the strategy fires rarely.
+• 1-hour candles close 24 times per day. Warmup is ~8.3 days (200 bars).
+  Fast enough to watch the system work; slow enough to reduce noise.
+
+The strategy (50/200 MA) was designed for daily bars. On hourly bars it
+becomes a 50h/200h MA. The golden cross still means "recent trend is above
+long-term trend" — the logic is identical, the timescale is compressed.
+
+
+THE WEBSOCKET PROTOCOL
+───────────────────────
+Binance sends one JSON message per event. For kline (candlestick) events:
+
+    {
+      "e": "kline",
+      "k": {
+        "t": 1638747600000,   // candle OPEN time (ms since epoch)
+        "T": 1638751200000,   // candle CLOSE time (ms since epoch)
+        "s": "BTCUSDT",
+        "i": "1h",
+        "o": "57000.00",
+        "h": "57500.00",
+        "l": "56800.00",
+        "c": "57200.00",      // current close (updates during the candle)
+        "v": "123.456",
+        "x": true             // IS THIS CANDLE CLOSED?
+      }
+    }
+
+The critical field is k.x (is_closed). Binance sends updates throughout
+the candle's lifetime with partial data. We ONLY process bars where k.x is
+true — the candle is complete and the close price is final.
+
+Acting on a partial candle would be a form of look-ahead: you would be
+making a decision based on incomplete information for that period.
+
+
+THE BOOTSTRAP → LIVE TRANSITION
+─────────────────────────────────
+The MA(200) requires 200 bars of history before the first signal can fire.
+We cannot wait 8.3 days from a cold start. The bootstrap solves this:
+
+1. At startup: fetch the last 201 (slow+1) 1h bars from the Binance REST API.
+   This takes ~0.5 seconds and provides ~8.3 days of history instantly.
+
+2. Feed those bars to LiveEngine.initialize(). This fills the rolling deque
+   and sets the initial portfolio state.
+
+3. Connect the WebSocket. Process live bars from this point onward.
+
+THE 201-BAR BOOTSTRAP
+Why slow+1 (201) bars instead of slow (200)?
+
+The event-driven backtest's "first-bar init" step sets:
+    portfolio.position = signal[slow-1]   (the PREVIOUS signal)
+    prev_close         = bars[slow].close
+
+Then records rows from bars[slow+1] onward. So the "current" signal at
+start-of-live is signal[slow], but the portfolio's position reflects the
+signal from one bar earlier (signal[slow-1]).
+
+With only slow bars in bootstrap, we have just one signal observation and
+cannot know what the "previous" signal was. The first live bar might then
+charge a spurious fee (if the signal is changing) because portfolio.position
+would be initialized to the current signal instead of the previous one.
+
+With slow+1 bars, initialize() observes two consecutive signals:
+    bars[0..slow-1] → signal[slow-1]   = prev_signal
+    bars[0..slow]   → signal[slow]     = pending_signal
+    portfolio.position = prev_signal
+    pending_signal     = pending_signal
+
+This correctly mirrors the backtest, and the parity tests prove it:
+    test_parity_multiple_crossovers  — verified to 1e-9 on all columns
+
+
+THE RECONNECTION LOGIC
+───────────────────────
+WebSocket connections drop. Network blips, server restarts, idle timeouts.
+feed/binance.py handles this transparently with exponential backoff:
+
+    backoff = 1s after first disconnect
+    backoff doubles each retry, capped at 60s
+    Resets to 1s on a successful reconnection
+
+The MA window is maintained in memory during a disconnect — we do NOT
+re-bootstrap when reconnecting. The window state carries over. If the
+disconnect lasts longer than a candle interval, we will miss one or more
+candles. This is an acceptable gap in a paper system; Phase 5 would add
+gap detection and recovery.
+
+
+HOW TO RUN
+───────────
+1. Install dependencies:
+       pip install -r requirements.txt
+
+2. Start the live session from the repo root:
+       python live/runner.py
+
+3. What you see:
+   - Bootstrap log: "fetching 201 × 1h bars for BTCUSDT ..."
+   - Engine ready log: MA50=... MA200=... prev_pos=... pending=...
+   - "Live session started. Press Ctrl+C to stop."
+   - One line per hour when a candle closes:
+     "2024-01-15 14:00 UTC | close=  42150.30 | ret= +0.123% | MA50=...  MA200=... | LONG | equity=1.000023"
+   - [TRADE] tag appears on bars where the position changes
+
+4. Press Ctrl+C to stop. A summary prints:
+   Total return, ann return, vol, Sharpe, max drawdown, turnover.
+
+You will likely see very few trades per day — the 50/200 MA is a slow
+trend-following rule. Most bars will show "LONG" or "FLAT" with no trade.
+
+
+WHAT TO NOTICE IN THE OUTPUT
+──────────────────────────────
+1. The MA values converge quickly from the bootstrap and then update
+   slowly. MA200 barely moves each hour (it is an average of 200 bars).
+
+2. The first trade after startup may fire immediately (if the pending
+   signal differs from the initial portfolio position). Subsequent trades
+   only fire when the MA crossover changes state.
+
+3. The equity curve starts at 1.0 and should track the BTC/USDT move
+   during long periods, staying flat during flat periods.
+
+4. Sharpe computed from a few hours of live data is meaningless — there
+   is no statistical significance. The live metrics only become meaningful
+   after days or weeks of operation.
+
+
+QUESTIONS TO ASK YOURSELF
+───────────────────────────
+Before moving to Phase 4:
+
+1. The bootstrap fetches 201 bars from the REST API. Those bars are
+   "already in the past." What happens if the market was very volatile
+   during the bootstrap period — could the initial position be wrong?
+   How would you know?
+
+2. If the WebSocket disconnects for exactly 2 hours, the MA window
+   will be stale by 2 bars. How would you detect this and what would
+   you do about it?
+
+3. The live engine uses arithmetic: sum(window[-fast:]) / fast. For
+   slow=200, this is 200 additions per bar. With minute bars (1,440 bars
+   per day), that's 288,000 additions. Would you optimize this, and if
+   so, how? (Hint: running sum, or exponential moving average.)
+
+4. The parity test uses generate_signals() for both engines. Why does
+   this mean the test cannot catch a bug in generate_signals() itself?
+   What would you test to close that gap?
+
+
+WHAT'S NEXT — PHASE 4
+──────────────────────
+Phase 4 replaces the simulated _Broker with a real testnet execution client.
+
+When an OrderEvent fires, instead of immediately returning a FillEvent,
+the broker sends a market order to the Binance testnet and waits for the
+exchange to confirm the fill. The FillEvent is populated from the exchange
+response — real price, real fee, real fill quantity.
+
+The strategy, portfolio, and LiveEngine are unchanged. The only new
+component is a real broker implementation.
+
+This is where execution risk becomes real: orders can be rejected, fills
+can be partial, latency between OrderEvent and FillEvent introduces
+slippage. Phase 5 will harden the system against these failure modes.

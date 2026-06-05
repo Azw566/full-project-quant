@@ -1,0 +1,255 @@
+"""
+live/engine.py — Online execution engine for live paper trading.
+
+Drives the same four-event pipeline used in backtest/event_driven.py:
+
+    MarketEvent → SignalEvent → OrderEvent → FillEvent
+
+The key difference from the backtest engine: instead of replaying a
+pre-computed signals array, the LiveEngine maintains a rolling window of
+the last `slow` closes and recomputes the MA crossover signal online,
+one bar at a time.
+
+The _Portfolio and _Broker components are imported directly from
+backtest/event_driven.py — unchanged. This is the North Star principle
+made literal: the same execution components run in both backtest and live.
+
+PUBLIC INTERFACE
+────────────────
+    engine = LiveEngine(portfolio, broker, fast, slow)
+    engine.initialize(bootstrap_bars)   # warm up MA from historical data
+    engine.on_bar(bar) → dict | None    # process one live bar
+    engine.get_results() → pd.DataFrame
+    engine.get_metrics() → dict | None
+"""
+
+from __future__ import annotations
+
+import logging
+from collections import deque
+
+import pandas as pd
+
+from backtest.event_driven import (
+    FillEvent,
+    MarketEvent,
+    OrderEvent,
+    SignalEvent,
+    _Broker,
+    _Portfolio,
+)
+from backtest.metrics import compute_metrics
+
+logger = logging.getLogger(__name__)
+
+# Number of trading periods per year for each supported interval.
+# Used by compute_metrics() — it needs to know how to annualize.
+_PERIODS_PER_YEAR: dict[str, float] = {
+    "1m":  525_600,
+    "5m":  105_120,
+    "15m":  35_040,
+    "1h":   8_760,
+    "4h":   2_190,
+    "1d":     252,
+}
+
+
+class LiveEngine:
+    """
+    Online event engine.
+
+    Maintains a rolling deque of the last `slow` closing prices to compute
+    the MA crossover signal after each bar. Applies the same 1-bar signal
+    lag used in the backtest engines: the signal computed from bar t's close
+    determines the position held on bar t+1.
+    """
+
+    def __init__(
+        self,
+        portfolio: _Portfolio,
+        broker: _Broker,
+        fast: int,
+        slow: int,
+    ) -> None:
+        self._portfolio = portfolio
+        self._broker    = broker
+        self._fast      = fast
+        self._slow      = slow
+
+        self._window: deque[float] = deque(maxlen=slow)
+        self._prev_close:     float | None = None
+        self._pending_signal: float | None = None  # signal from the previous bar
+        self._rows: list[dict] = []
+
+    # ── Initialization ─────────────────────────────────────────────────────────
+
+    def initialize(self, bootstrap_bars: list[dict]) -> None:
+        """
+        Prime the rolling MA window using the historical bootstrap bars.
+
+        These bars are in the past — no trades are recorded.
+        After this call, the engine is ready to process live candles.
+
+        ALIGNMENT WITH THE BACKTEST ENGINE
+        ───────────────────────────────────
+        The event-driven backtest silently initializes two pieces of state
+        from its first-bar:
+            portfolio.position = signal[t-1]   (the "previous" signal)
+            prev_close         = close[t]
+        and records rows from bar t+1 onward.
+
+        To match this, initialize() tracks TWO consecutive signals from the
+        bootstrap — it needs at least slow+1 bars to do so:
+            prev_signal    = signal after processing bar[slow-1]
+            pending_signal = signal after processing bar[slow]
+        Then portfolio.position = prev_signal mirrors the backtest.
+
+        With fewer than slow+1 bars there is no prev_signal, so
+        portfolio.position defaults to pending_signal. The first row may
+        then carry a spurious fee if the signal changed on the last bar.
+        """
+        prev_signal: float | None = None
+
+        for bar in bootstrap_bars:
+            self._window.append(float(bar["close"]))
+            if len(self._window) == self._slow:
+                # Each time the window first becomes full, rotate signals:
+                # prev gets the old pending, pending gets the freshly computed one.
+                prev_signal          = self._pending_signal
+                self._pending_signal = self._compute_signal()
+
+        if len(self._window) < self._slow:
+            logger.warning(
+                "Bootstrap only provided %d/%d bars. Engine will complete "
+                "warmup from the live stream before trading.",
+                len(self._window), self._slow,
+            )
+            return
+
+        # portfolio.position = prev_signal so first-row fee matches the backtest.
+        self._portfolio.position = prev_signal if prev_signal is not None else self._pending_signal
+        self._prev_close         = float(bootstrap_bars[-1]["close"])
+
+        logger.info(
+            "Engine ready. MA%d=%.2f  MA%d=%.2f  prev_pos=%.0f  pending=%.0f",
+            self._fast, self._fast_ma(),
+            self._slow, self._slow_ma(),
+            self._portfolio.position, self._pending_signal,
+        )
+
+    # ── Per-bar processing ─────────────────────────────────────────────────────
+
+    def on_bar(self, bar: dict) -> dict | None:
+        """
+        Process one closed candle from the live feed.
+
+        Returns the result row dict if a full event cycle was completed,
+        or None during the warmup period.
+
+        THE 1-BAR LAG
+        ─────────────
+        Signal computed at close of bar T → position held on bar T+1.
+        Stored as self._pending_signal between calls.
+
+        This mirrors backtest/event_driven.py's signals.shift(1) and
+        ensures live and backtest results are computed identically.
+        """
+        close: float        = float(bar["close"])
+        ts:    pd.Timestamp = bar["timestamp"]
+
+        self._window.append(close)
+
+        # Still in warmup — not enough history to compute both MAs.
+        if len(self._window) < self._slow:
+            logger.debug("Warmup: %d/%d bars.", len(self._window), self._slow)
+            self._prev_close = close
+            return None
+
+        current_signal = self._compute_signal()
+
+        # First bar after reaching the warmup threshold.
+        if self._pending_signal is None or self._prev_close is None:
+            self._pending_signal         = current_signal
+            self._prev_close             = close
+            self._portfolio.position     = current_signal
+            logger.info(
+                "%s | Warmup complete. Initial position=%.0f", ts, current_signal,
+            )
+            return None
+
+        # ── Event pipeline ────────────────────────────────────────────────────
+        market_return = close / self._prev_close - 1.0
+
+        market_evt = MarketEvent(timestamp=ts, close=close, market_return=market_return)
+        signal_evt = SignalEvent(timestamp=ts, target_position=self._pending_signal)
+        order_evt  = self._portfolio.on_signal(signal_evt)
+        fill_evt   = self._broker.on_order(order_evt)
+        row        = self._portfolio.on_fill(fill_evt, market_return)
+        row["timestamp"] = ts
+
+        self._rows.append(row)
+        _log_bar(ts, close, market_return, row, self._fast_ma(), self._slow_ma())
+
+        # Advance state — store current bar's signal for next bar.
+        self._pending_signal = current_signal
+        self._prev_close     = close
+
+        return row
+
+    # ── Results ────────────────────────────────────────────────────────────────
+
+    def get_results(self) -> pd.DataFrame:
+        """Return all processed bars as a DataFrame indexed by timestamp."""
+        if not self._rows:
+            return pd.DataFrame()
+        return pd.DataFrame(self._rows).set_index("timestamp")
+
+    def get_metrics(self, interval: str = "1h") -> dict | None:
+        """
+        Compute performance metrics from the session so far.
+
+        Passes the correct annualization factor for the candle interval to
+        compute_metrics() — hourly bars annualize differently than daily bars.
+        Returns None if fewer than 2 bars have been processed.
+        """
+        df = self.get_results()
+        if len(df) < 2:
+            return None
+        return compute_metrics(df["net_return"], df["position"])
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _fast_ma(self) -> float:
+        closes = list(self._window)
+        return sum(closes[-self._fast :]) / self._fast
+
+    def _slow_ma(self) -> float:
+        return sum(self._window) / len(self._window)
+
+    def _compute_signal(self) -> float:
+        return 1.0 if self._fast_ma() > self._slow_ma() else 0.0
+
+
+# ── Logging helper ─────────────────────────────────────────────────────────────
+
+def _log_bar(
+    ts: pd.Timestamp,
+    close: float,
+    market_return: float,
+    row: dict,
+    fast_ma: float,
+    slow_ma: float,
+) -> None:
+    side      = "LONG" if row["position"] == 1.0 else "FLAT"
+    trade_tag = f"  [TRADE  fee={row['fee']:.4%}]" if row["fee"] > 0 else ""
+    logger.info(
+        "%s | close=%10.2f | ret=%+7.3f%% | MA50=%10.2f  MA200=%10.2f | %-4s | equity=%.6f%s",
+        ts.strftime("%Y-%m-%d %H:%M UTC"),
+        close,
+        market_return * 100,
+        fast_ma,
+        slow_ma,
+        side,
+        row["equity"],
+        trade_tag,
+    )
