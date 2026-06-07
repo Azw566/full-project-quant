@@ -14,9 +14,14 @@ The _Portfolio and _Broker components are imported directly from
 backtest/event_driven.py — unchanged. This is the North Star principle
 made literal: the same execution components run in both backtest and live.
 
+Phase 5 addition: pass bootstrap_fn=feed.bootstrap at construction time.
+When a WebSocket gap is detected, the engine calls bootstrap_fn() to
+re-fetch the last slow+1 bars from the REST API and re-initialises the
+MA window, preventing stale-state trading after a disconnect.
+
 PUBLIC INTERFACE
 ────────────────
-    engine = LiveEngine(portfolio, broker, fast, slow)
+    engine = LiveEngine(portfolio, broker, fast, slow, bootstrap_fn=None)
     engine.initialize(bootstrap_bars)   # warm up MA from historical data
     engine.on_bar(bar) → dict | None    # process one live bar
     engine.get_results() → pd.DataFrame
@@ -67,15 +72,27 @@ class LiveEngine:
 
     def __init__(
         self,
-        portfolio: _Portfolio,
-        broker: _Broker,
-        fast: int,
-        slow: int,
+        portfolio:    _Portfolio,
+        broker:       _Broker,
+        fast:         int,
+        slow:         int,
+        bootstrap_fn=None,
     ) -> None:
-        self._portfolio = portfolio
-        self._broker    = broker
-        self._fast      = fast
-        self._slow      = slow
+        """
+        Parameters
+        ----------
+        portfolio, broker : shared execution components from event_driven.py.
+        fast, slow        : MA window sizes.
+        bootstrap_fn      : optional callable () → list[dict].  When provided,
+                            a gap in the live stream triggers a call to
+                            bootstrap_fn() followed by self.initialize() to
+                            restore a correct MA window state.
+        """
+        self._portfolio    = portfolio
+        self._broker       = broker
+        self._fast         = fast
+        self._slow         = slow
+        self._bootstrap_fn = bootstrap_fn
 
         self._window: deque[float] = deque(maxlen=slow)
         self._prev_close:     float | None = None
@@ -158,64 +175,81 @@ class LiveEngine:
         Signal computed at close of bar T → position held on bar T+1.
         Stored as self._pending_signal between calls.
 
-        This mirrors backtest/event_driven.py's signals.shift(1) and
-        ensures live and backtest results are computed identically.
+        GAP RE-BOOTSTRAP
+        ─────────────────
+        If a gap is detected and bootstrap_fn was provided, the MA window is
+        re-initialised from fresh REST data before processing the current bar.
+        self._prev_ts is updated at the end of the call (via finally) so that
+        after a re-bootstrap it correctly reflects the current bar, not the
+        stale last-bootstrap bar.
         """
         close: float        = float(bar["close"])
         ts:    pd.Timestamp = bar["timestamp"]
 
         # Gap detection: warn if a disconnect caused missed candles.
-        # The expected interval is derived from the first two consecutive bars.
         if self._prev_ts is not None:
             if self._bar_interval is None:
                 self._bar_interval = ts - self._prev_ts
             elif ts - self._prev_ts > self._bar_interval * 1.5:
                 missed = round((ts - self._prev_ts) / self._bar_interval) - 1
                 logger.warning(
-                    "GAP: %d bar(s) missed between %s and %s. "
-                    "MA window is stale — consider re-bootstrapping.",
+                    "GAP: %d bar(s) missed between %s and %s.",
                     missed, self._prev_ts, ts,
                 )
-        self._prev_ts = ts
+                if self._bootstrap_fn is not None:
+                    logger.info("Re-bootstrapping MA window after gap...")
+                    fresh_bars = self._bootstrap_fn()
+                    self.initialize(fresh_bars)
+                    logger.info("Re-bootstrap complete.")
+                else:
+                    logger.warning(
+                        "MA window is stale — no bootstrap_fn provided."
+                    )
 
-        self._window.append(close)
+        try:
+            self._window.append(close)
 
-        # Still in warmup — not enough history to compute both MAs.
-        if len(self._window) < self._slow:
-            logger.debug("Warmup: %d/%d bars.", len(self._window), self._slow)
-            self._prev_close = close
-            return None
+            # Still in warmup — not enough history to compute both MAs.
+            if len(self._window) < self._slow:
+                logger.debug("Warmup: %d/%d bars.", len(self._window), self._slow)
+                self._prev_close = close
+                return None
 
-        current_signal = self._compute_signal()
+            current_signal = self._compute_signal()
 
-        # First bar after reaching the warmup threshold.
-        if self._pending_signal is None or self._prev_close is None:
-            self._pending_signal         = current_signal
-            self._prev_close             = close
-            self._portfolio.position     = current_signal
-            logger.info(
-                "%s | Warmup complete. Initial position=%.0f", ts, current_signal,
-            )
-            return None
+            # First bar after reaching the warmup threshold.
+            if self._pending_signal is None or self._prev_close is None:
+                self._pending_signal     = current_signal
+                self._prev_close         = close
+                self._portfolio.position = current_signal
+                logger.info(
+                    "%s | Warmup complete. Initial position=%.0f", ts, current_signal,
+                )
+                return None
 
-        # ── Event pipeline ────────────────────────────────────────────────────
-        market_return = close / self._prev_close - 1.0
+            # ── Event pipeline ─────────────────────────────────────────────────
+            market_return = close / self._prev_close - 1.0
 
-        market_evt = MarketEvent(timestamp=ts, close=close, market_return=market_return)
-        signal_evt = SignalEvent(timestamp=ts, target_position=self._pending_signal)
-        order_evt  = self._portfolio.on_signal(signal_evt)
-        fill_evt   = self._broker.on_order(order_evt)
-        row        = self._portfolio.on_fill(fill_evt, market_return)
-        row["timestamp"] = ts
+            market_evt = MarketEvent(timestamp=ts, close=close, market_return=market_return)
+            signal_evt = SignalEvent(timestamp=ts, target_position=self._pending_signal)
+            order_evt  = self._portfolio.on_signal(signal_evt)
+            fill_evt   = self._broker.on_order(order_evt)
+            row        = self._portfolio.on_fill(fill_evt, market_return)
+            row["timestamp"] = ts
 
-        self._rows.append(row)
-        _log_bar(ts, close, market_return, row, self._fast_ma(), self._slow_ma())
+            self._rows.append(row)
+            _log_bar(ts, close, market_return, row, self._fast_ma(), self._slow_ma())
 
-        # Advance state — store current bar's signal for next bar.
-        self._pending_signal = current_signal
-        self._prev_close     = close
+            # Advance state — store current bar's signal for next bar.
+            self._pending_signal = current_signal
+            self._prev_close     = close
 
-        return row
+            return row
+
+        finally:
+            # Always update _prev_ts AFTER gap detection and any re-bootstrap,
+            # so the next call sees this bar's timestamp as the reference point.
+            self._prev_ts = ts
 
     # ── Results ────────────────────────────────────────────────────────────────
 

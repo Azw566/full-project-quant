@@ -105,6 +105,7 @@ def main() -> None:
 
     feed_cfg = cfg["feed"]
     bt_cfg   = cfg["backtest"]
+    risk_cfg = cfg.get("risk", {})
 
     symbol   = feed_cfg["symbol"]
     interval = feed_cfg["interval"]
@@ -112,21 +113,49 @@ def main() -> None:
     slow     = bt_cfg["slow_ma"]
     fee_bps  = bt_cfg["fee_bps"]
 
-    feed      = BinanceFeed(symbol, interval, warmup_bars=slow + 1)
-    portfolio = _Portfolio()
+    # Risk parameters from config (all optional — defaults disable each feature).
+    vol_target      = risk_cfg.get("vol_target",    None)
+    vol_lookback    = risk_cfg.get("vol_lookback",  20)
+    max_drawdown    = risk_cfg.get("max_drawdown",  None)
+    cooldown_bars   = risk_cfg.get("cooldown_bars", 20)
+    slippage_bps    = risk_cfg.get("slippage_bps",  0.0)
+
+    # Annualisation factor for vol targeting — must match the candle interval.
+    _PERIODS: dict[str, float] = {
+        "1m": 525_600, "5m": 105_120, "15m": 35_040,
+        "1h": 8_760,   "4h": 2_190,   "1d": 252,
+    }
+    periods_per_year = _PERIODS.get(interval, 252)
+
+    feed = BinanceFeed(symbol, interval, warmup_bars=slow + 1)
+
+    portfolio = _Portfolio(
+        vol_target=vol_target,
+        vol_lookback=vol_lookback,
+        periods_per_year=periods_per_year,
+        max_drawdown=max_drawdown,
+        cooldown_bars=cooldown_bars,
+    )
 
     if args.testnet:
         from execution.binance_broker import TestnetBroker, load_credentials
         api_key, api_secret = load_credentials()
         order_qty = cfg.get("testnet", {}).get("order_qty", 0.001)
-        broker    = TestnetBroker(api_key, api_secret, symbol=symbol, order_qty=order_qty)
+        # Real fills already include spread — no simulated slippage on top.
+        broker = TestnetBroker(api_key, api_secret, symbol=symbol, order_qty=order_qty)
         broker.sync_clock()
         logger.info("Broker: Binance Spot Testnet  |  order_qty=%.4f BTC", order_qty)
     else:
-        broker = _Broker(fee_bps)
-        logger.info("Broker: simulated paper  |  fee_bps=%.1f", fee_bps)
+        broker = _Broker(fee_bps, slippage_bps)
+        logger.info(
+            "Broker: simulated paper  |  fee_bps=%.1f  slippage_bps=%.1f",
+            fee_bps, slippage_bps,
+        )
 
-    engine = LiveEngine(portfolio, broker, fast=fast, slow=slow)
+    engine = LiveEngine(
+        portfolio, broker, fast=fast, slow=slow,
+        bootstrap_fn=feed.bootstrap,
+    )
 
     # Synchronous bootstrap — blocks for ~0.5 s, runs before event loop.
     bootstrap_bars = feed.bootstrap()

@@ -34,3 +34,15 @@ backtest:
   slow_ma:     200     # Slow moving average window (bars)
   fee_bps:     10.0    # One-way transaction cost (10 bps = 0.10% per trade)
   train_ratio: 0.7     # In-sample fraction; last (1 - ratio) is out-of-sample
+
+# ── Phase 5 — Risk management ─────────────────────────────────────────────────
+# All entries are optional. Remove or set to null to disable a feature.
+risk:
+  vol_target:    0.20   # Annualized vol target; position is scaled so portfolio
+                        # realised vol tracks this level. null = no scaling.
+  vol_lookback:  20     # Rolling window (bars) for realised-vol estimate.
+  max_drawdown:  0.15   # Circuit-breaker trigger: go flat when equity falls this
+                        # fraction below its running peak (0.15 = 15% drawdown).
+  cooldown_bars: 20     # Bars to stay flat after circuit fires before re-entering.
+  slippage_bps:  5.0    # Simulated half-spread per trade (one-way, same units
+                        # as fee_bps). Added on top of fee_bps in paper mode.

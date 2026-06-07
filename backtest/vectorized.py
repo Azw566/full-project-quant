@@ -8,18 +8,28 @@ baseline, but structurally unable to prevent look-ahead bias on its own.
 Phase 2 replaces this with an event-driven loop that makes look-ahead impossible
 by design. The key test of Phase 2: it must reproduce these numbers exactly.
 
+Phase 5 adds optional vol targeting and slippage, matching the extensions made
+to the event-driven engine so the parity invariant is preserved.
+
 PUBLIC INTERFACE
 ────────────────
-    run(bars, signals, fee_bps) → pd.DataFrame
+    run(bars, signals, fee_bps, ...) → pd.DataFrame
 """
 
+import math
+
+import numpy as np
 import pandas as pd
 
 
 def run(
-    bars: pd.DataFrame,
-    signals: pd.Series,
-    fee_bps: float = 10.0,
+    bars:             pd.DataFrame,
+    signals:          pd.Series,
+    fee_bps:          float        = 10.0,
+    slippage_bps:     float        = 0.0,
+    vol_target:       float | None = None,
+    vol_lookback:     int          = 20,
+    periods_per_year: float        = 252.0,
 ) -> pd.DataFrame:
     """
     Run a vectorized backtest and return a result DataFrame.
@@ -29,24 +39,30 @@ def run(
     bars : pd.DataFrame
         OHLCV data with a DatetimeIndex. Must have a 'close' column.
     signals : pd.Series
-        Raw position signal from the strategy (1.0 = long, 0.0 = flat, NaN = warmup).
-        Must be aligned to bars (same index).
+        Raw position signal (1.0 = long, 0.0 = flat, NaN = warmup).
     fee_bps : float
-        One-way transaction cost in basis points.
-        10 bps = 0.10% per trade side.
-        Applied whenever the position changes (i.e. on each trade).
+        One-way exchange commission in basis points.
+    slippage_bps : float
+        Half-spread proxy per side in basis points (0 = disabled).
+        Added on top of fee_bps; reported separately in the output.
+    vol_target : float | None
+        Annualised vol target. When set, position is scaled so realised
+        portfolio vol tracks this level. None = no scaling (default).
+    vol_lookback : int
+        Rolling window (bars) for realised-vol estimate.
+    periods_per_year : float
+        Annualisation factor (252 for daily bars, 8760 for 1h bars).
 
     Returns
     -------
     pd.DataFrame with columns:
         position       — actual position held on this bar (after 1-bar lag)
         market_return  — raw close-to-close return (buy-and-hold reference)
-        gross_return   — strategy return before fees (position × market_return)
-        fee            — cost paid on this bar (0 unless a trade occurred)
-        net_return     — strategy return after fees
+        gross_return   — strategy return before costs (position × market_return)
+        fee            — exchange commission paid on this bar
+        slippage       — half-spread cost paid on this bar
+        net_return     — strategy return after all costs
         equity         — cumulative equity curve starting at 1.0
-
-    Warmup rows (where the signal is NaN) are dropped before returning.
 
     THE ANTI-LOOK-AHEAD MECHANISM
     ──────────────────────────────
@@ -54,57 +70,62 @@ def run(
 
         position = signals.shift(1)
 
-    Today's signal is computed from today's closing prices. We cannot act
-    on information from today's close BEFORE today's close happens. So we
-    shift the signal forward by one bar: a signal generated at close of day T
-    enters our position at the open of day T+1 (approximated as close of T+1).
+    VOL TARGETING
+    ─────────────
+    When vol_target is set, position is scaled by vol_target / realised_vol
+    (capped at 1.0 so we never lever up).  The realised-vol estimate at bar t
+    uses only returns through bar t-1, matching the event-driven engine's
+    rolling deque which is filled one bar behind on_signal().
 
-    Without this shift, the backtest assumes you can trade at the exact closing
-    price at the moment you decide to trade — which is impossible. This is
-    a classic look-ahead bias. One missing .shift(1) can turn a losing strategy
-    into a phantom winner.
-
-    FEE MODEL
-    ─────────
-    fee_bps applies to each side of a trade. When position changes from 0→1,
-    we are "buying in" and pay fee_bps on the notional. When 1→0, we are
-    "selling out" and pay again. In this simplified model, we treat each bar's
-    position change as triggering a proportional cost:
-
-        trade_size[t] = |position[t] - position[t-1]|   (0 or 1 here)
-        fee[t]        = trade_size[t] × (fee_bps / 10_000)
-
-    Real systems add slippage (market impact) and the bid-ask spread on top
-    of the explicit fee — see the project guide for Phase 5 hardening.
+    Implementation: lagged_returns = market_return.shift(1), then
+    rolling(vol_lookback).std().  The extra shift ensures the rolling window
+    at bar t covers returns t-vol_lookback .. t-1, identical to the deque
+    contents when on_signal(t) is called in the event-driven engine.
     """
-    fee_rate = fee_bps / 10_000.0
+    fee_rate      = fee_bps      / 10_000.0
+    slippage_rate = slippage_bps / 10_000.0
 
     # Shift signal by 1 bar to avoid look-ahead.
     position = signals.shift(1).rename("position")
 
     # Drop warmup rows where position is NaN.
-    mask = position.notna()
-    position = position[mask].astype(float)
+    mask       = position.notna()
+    position   = position[mask].astype(float)
     bars_clean = bars.loc[mask]
 
-    # Close-to-close daily return.
+    # Close-to-close return.
     market_return = bars_clean["close"].pct_change().rename("market_return")
 
-    # Strategy gross return: what fraction of the market return we captured.
+    # ── Vol targeting ─────────────────────────────────────────────────────────
+    # Uses lagged returns so at bar t we only see info through t-1.
+    # This matches on_signal(t) in the event-driven engine, where the deque
+    # contains returns appended in on_fill() calls for bars 0 .. t-1.
+    if vol_target is not None and vol_target > 0.0:
+        lagged_returns = market_return.shift(1)
+        rolled_vol = (
+            lagged_returns.rolling(vol_lookback).std(ddof=1)
+            * math.sqrt(periods_per_year)
+        )
+        # NaN before the lookback window fills → fillna(1.0) = no scaling.
+        # vol → 0 gives inf → clip to 1.0 = no scaling up.
+        vol_scale = (vol_target / rolled_vol).clip(upper=1.0).fillna(1.0)
+        position  = position * vol_scale
+
+    # ── Cost and return series ────────────────────────────────────────────────
     gross_return = (position * market_return).rename("gross_return")
 
-    # Fee: paid on every position change, proportional to position size moved.
-    trade = position.diff().abs()
-    fee = (trade * fee_rate).rename("fee")
+    trade    = position.diff().abs()
+    fee      = (trade * fee_rate).rename("fee")
+    slippage = (trade * slippage_rate).rename("slippage")
 
-    # Net return after costs.
-    net_return = (gross_return - fee).rename("net_return")
+    net_return = (gross_return - fee - slippage).rename("net_return")
 
     result = pd.DataFrame({
         "position":      position,
         "market_return": market_return,
         "gross_return":  gross_return,
         "fee":           fee,
+        "slippage":      slippage,
         "net_return":    net_return,
     })
 
