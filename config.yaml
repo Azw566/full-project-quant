@@ -35,6 +35,14 @@ backtest:
   fee_bps:     10.0    # One-way transaction cost (10 bps = 0.10% per trade)
   train_ratio: 0.7     # In-sample fraction; last (1 - ratio) is out-of-sample
 
+# ── Phase 6 — Portfolio (multi-asset live runner) ─────────────────────────────
+# Symbols to trade concurrently when running: python live/runner.py --portfolio
+# Each symbol gets an independent LiveEngine with equal weight in the aggregate.
+portfolio:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+
 # ── Phase 5 — Risk management ─────────────────────────────────────────────────
 # All entries are optional. Remove or set to null to disable a feature.
 risk:

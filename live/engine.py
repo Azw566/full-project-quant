@@ -44,20 +44,9 @@ from backtest.event_driven import (
     _Broker,
     _Portfolio,
 )
-from backtest.metrics import compute_metrics
+from backtest.metrics import PERIODS_PER_YEAR, compute_metrics
 
 logger = logging.getLogger(__name__)
-
-# Number of trading periods per year for each supported interval.
-# Used by compute_metrics() — it needs to know how to annualize.
-_PERIODS_PER_YEAR: dict[str, float] = {
-    "1m":  525_600,
-    "5m":  105_120,
-    "15m":  35_040,
-    "1h":   8_760,
-    "4h":   2_190,
-    "1d":     252,
-}
 
 
 class LiveEngine:
@@ -270,7 +259,7 @@ class LiveEngine:
         df = self.get_results()
         if len(df) < 2:
             return None
-        periods = _PERIODS_PER_YEAR.get(interval, 252)
+        periods = PERIODS_PER_YEAR.get(interval, 252)
         return compute_metrics(df["net_return"], df["position"], periods_per_year=periods)
 
     # ── Private helpers ────────────────────────────────────────────────────────

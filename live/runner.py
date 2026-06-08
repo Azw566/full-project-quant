@@ -2,15 +2,21 @@
 live/runner.py — Entry point for the live trading session.
 
 Usage (from the repo root):
-    python live/runner.py              # paper mode (simulated fills)
-    python live/runner.py --testnet    # testnet mode (real Binance testnet orders)
+    python live/runner.py                      # single-asset paper mode
+    python live/runner.py --testnet            # single-asset testnet mode
+    python live/runner.py --portfolio          # multi-asset paper mode
+
+Single-asset mode trades the symbol set in config.yaml → feed.symbol.
+Portfolio mode trades all symbols listed in config.yaml → portfolio.symbols
+with one independent LiveEngine per symbol. Results are printed per-asset and
+as a simple equal-weight aggregate at session end.
 
 What happens:
     1. Load config.yaml.
-    2. Bootstrap the last `slow_ma` closed 1h BTCUSDT candles from the
-       Binance REST API (sync, ~0.5s).
-    3. Initialize the LiveEngine with the bootstrap data.
-    4. Connect to the Binance WebSocket and process candles indefinitely,
+    2. Bootstrap the last `slow_ma` closed candles from the Binance REST API
+       (sync, ~0.5s per symbol).
+    3. Initialize each LiveEngine with its bootstrap data.
+    4. Connect to Binance WebSocket streams and process candles indefinitely,
        printing a line for every closed candle.
     5. On Ctrl+C: disconnect cleanly, print a session summary, and exit.
 
@@ -34,6 +40,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from backtest.event_driven import _Broker, _Portfolio
+from backtest.metrics import PERIODS_PER_YEAR
 from feed.binance import BinanceFeed
 from live.engine import LiveEngine
 
@@ -47,42 +54,66 @@ logger = logging.getLogger(__name__)
 
 # ── Session summary ────────────────────────────────────────────────────────────
 
-def _print_summary(engine: LiveEngine, cfg: dict) -> None:
+# ── Session summary helpers ────────────────────────────────────────────────────
+
+def _print_engine_summary(symbol: str, engine: LiveEngine, interval: str) -> None:
+    df = engine.get_results()
+    if df.empty:
+        print(f"  {symbol:10s}: no completed bars (session ended during warmup).")
+        return
+
+    metrics = engine.get_metrics(interval)
+    print(f"\n  {symbol}")
+    print(f"    Bars          : {len(df)}")
+    print(f"    From / To     : {df.index[0]}  →  {df.index[-1]}")
+    if metrics:
+        print(f"    Total return  : {metrics['total_return']:>+.2%}")
+        print(f"    Ann return    : {metrics['ann_return']:>+.2%}")
+        print(f"    Ann vol       : {metrics['ann_vol']:>.2%}")
+        print(f"    Sharpe ratio  : {metrics['sharpe']:>+.2f}")
+        print(f"    Max drawdown  : {metrics['max_drawdown']:>.2%}")
+        print(f"    Ann turnover  : {metrics['ann_turnover']:>.2f}x")
+    else:
+        print("    (not enough bars to compute metrics)")
+
+
+def _print_summary(engines: dict[str, LiveEngine], cfg: dict) -> None:
     feed_cfg = cfg["feed"]
+    interval = feed_cfg["interval"]
+
     print("\n" + "=" * 62)
     print("  LIVE SESSION SUMMARY")
     print("=" * 62)
 
-    df = engine.get_results()
-    if df.empty:
-        print("  No completed bars recorded (session ended during warmup).")
-        print()
-        return
+    for symbol, engine in engines.items():
+        _print_engine_summary(symbol, engine, interval)
 
-    print(f"\n  Symbol   : {feed_cfg['symbol']}")
-    print(f"  Interval : {feed_cfg['interval']}")
-    print(f"  Bars     : {len(df)}")
-    if not df.empty:
-        print(f"  From     : {df.index[0]}")
-        print(f"  To       : {df.index[-1]}")
+    # Portfolio aggregate when running multiple assets.
+    if len(engines) > 1:
+        import pandas as pd
+        net_returns = {}
+        for sym, eng in engines.items():
+            df = eng.get_results()
+            if not df.empty:
+                net_returns[sym] = df["net_return"]
 
-    metrics = engine.get_metrics(feed_cfg["interval"])
-    if metrics:
-        print(f"\n  Total return  : {metrics['total_return']:>+.2%}")
-        print(f"  Ann return    : {metrics['ann_return']:>+.2%}")
-        print(f"  Ann vol       : {metrics['ann_vol']:>.2%}")
-        print(f"  Sharpe ratio  : {metrics['sharpe']:>+.2f}")
-        print(f"  Max drawdown  : {metrics['max_drawdown']:>.2%}")
-        print(f"  Ann turnover  : {metrics['ann_turnover']:>.2f}x")
-    else:
-        print("\n  Not enough bars to compute metrics (need >= 2).")
+        if net_returns:
+            combined = pd.DataFrame(net_returns).dropna()
+            if not combined.empty:
+                ptf_ret = combined.mean(axis=1)
+                equity  = (1 + ptf_ret).cumprod()
+                total_r = float(equity.iloc[-1] - 1.0)
+                print(f"\n  PORTFOLIO (equal weight, {len(net_returns)} assets)")
+                print(f"    Total return  : {total_r:>+.2%}")
+                print(f"    Final equity  : {equity.iloc[-1]:.6f}")
+
     print()
 
 
-# ── Main async loop ────────────────────────────────────────────────────────────
+# ── Async stream helpers ───────────────────────────────────────────────────────
 
-async def _stream(feed: BinanceFeed, engine: LiveEngine) -> None:
-    """Drive the event loop: feed bars into the engine as candles close."""
+async def _stream_one(feed: BinanceFeed, engine: LiveEngine) -> None:
+    """Stream one asset into its engine until cancelled."""
     try:
         async for bar in feed.stream():
             engine.on_bar(bar)
@@ -90,12 +121,78 @@ async def _stream(feed: BinanceFeed, engine: LiveEngine) -> None:
         pass
 
 
+async def _stream_all(feed_engine_pairs: list[tuple[BinanceFeed, LiveEngine]]) -> None:
+    """Run multiple asset streams concurrently; cancel all on KeyboardInterrupt."""
+    tasks = [
+        asyncio.create_task(_stream_one(feed, engine))
+        for feed, engine in feed_engine_pairs
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ── Engine factory ─────────────────────────────────────────────────────────────
+
+
+
+def _build_engine(
+    symbol: str,
+    interval: str,
+    fast: int,
+    slow: int,
+    fee_bps: float,
+    risk_cfg: dict,
+    testnet: bool,
+    testnet_order_qty: float,
+    periods_per_year: float,
+) -> tuple[BinanceFeed, LiveEngine]:
+    feed = BinanceFeed(symbol, interval, warmup_bars=slow + 1)
+
+    portfolio = _Portfolio(
+        vol_target=risk_cfg.get("vol_target",    None),
+        vol_lookback=risk_cfg.get("vol_lookback",  20),
+        periods_per_year=periods_per_year,
+        max_drawdown=risk_cfg.get("max_drawdown",  None),
+        cooldown_bars=risk_cfg.get("cooldown_bars", 20),
+    )
+
+    if testnet:
+        from execution.binance_broker import TestnetBroker, load_credentials
+        api_key, api_secret = load_credentials()
+        broker = TestnetBroker(
+            api_key, api_secret, symbol=symbol, order_qty=testnet_order_qty,
+        )
+        broker.sync_clock()
+        logger.info("Broker[%s]: Binance Testnet  |  qty=%.4f", symbol, testnet_order_qty)
+    else:
+        slippage_bps = risk_cfg.get("slippage_bps", 0.0)
+        broker = _Broker(fee_bps, slippage_bps)
+        logger.info(
+            "Broker[%s]: paper  |  fee=%.1f bps  slip=%.1f bps",
+            symbol, fee_bps, slippage_bps,
+        )
+
+    engine = LiveEngine(portfolio, broker, fast=fast, slow=slow, bootstrap_fn=feed.bootstrap)
+    return feed, engine
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live trading session")
     parser.add_argument(
         "--testnet",
         action="store_true",
         help="Submit real orders to the Binance Spot Testnet (requires API keys in env)",
+    )
+    parser.add_argument(
+        "--portfolio",
+        action="store_true",
+        help="Run all symbols listed in config.yaml → portfolio.symbols concurrently",
     )
     args = parser.parse_args()
 
@@ -107,71 +204,58 @@ def main() -> None:
     bt_cfg   = cfg["backtest"]
     risk_cfg = cfg.get("risk", {})
 
-    symbol   = feed_cfg["symbol"]
-    interval = feed_cfg["interval"]
-    fast     = bt_cfg["fast_ma"]
-    slow     = bt_cfg["slow_ma"]
-    fee_bps  = bt_cfg["fee_bps"]
+    interval         = feed_cfg["interval"]
+    fast             = bt_cfg["fast_ma"]
+    slow             = bt_cfg["slow_ma"]
+    fee_bps          = bt_cfg["fee_bps"]
+    periods_per_year = PERIODS_PER_YEAR.get(interval, 252)
+    testnet_qty      = cfg.get("testnet", {}).get("order_qty", 0.001)
 
-    # Risk parameters from config (all optional — defaults disable each feature).
-    vol_target      = risk_cfg.get("vol_target",    None)
-    vol_lookback    = risk_cfg.get("vol_lookback",  20)
-    max_drawdown    = risk_cfg.get("max_drawdown",  None)
-    cooldown_bars   = risk_cfg.get("cooldown_bars", 20)
-    slippage_bps    = risk_cfg.get("slippage_bps",  0.0)
-
-    # Annualisation factor for vol targeting — must match the candle interval.
-    _PERIODS: dict[str, float] = {
-        "1m": 525_600, "5m": 105_120, "15m": 35_040,
-        "1h": 8_760,   "4h": 2_190,   "1d": 252,
-    }
-    periods_per_year = _PERIODS.get(interval, 252)
-
-    feed = BinanceFeed(symbol, interval, warmup_bars=slow + 1)
-
-    portfolio = _Portfolio(
-        vol_target=vol_target,
-        vol_lookback=vol_lookback,
-        periods_per_year=periods_per_year,
-        max_drawdown=max_drawdown,
-        cooldown_bars=cooldown_bars,
-    )
-
-    if args.testnet:
-        from execution.binance_broker import TestnetBroker, load_credentials
-        api_key, api_secret = load_credentials()
-        order_qty = cfg.get("testnet", {}).get("order_qty", 0.001)
-        # Real fills already include spread — no simulated slippage on top.
-        broker = TestnetBroker(api_key, api_secret, symbol=symbol, order_qty=order_qty)
-        broker.sync_clock()
-        logger.info("Broker: Binance Spot Testnet  |  order_qty=%.4f BTC", order_qty)
+    # Determine which symbols to trade.
+    if args.portfolio:
+        symbols = cfg.get("portfolio", {}).get("symbols", [feed_cfg["symbol"]])
+        if not symbols:
+            logger.error("portfolio.symbols is empty in config.yaml — aborting.")
+            return
     else:
-        broker = _Broker(fee_bps, slippage_bps)
-        logger.info(
-            "Broker: simulated paper  |  fee_bps=%.1f  slippage_bps=%.1f",
-            fee_bps, slippage_bps,
+        symbols = [feed_cfg["symbol"]]
+
+    # Build one feed + engine per symbol.
+    feed_engine_pairs: list[tuple[BinanceFeed, LiveEngine]] = []
+    engines: dict[str, LiveEngine] = {}
+
+    for sym in symbols:
+        feed, engine = _build_engine(
+            symbol=sym,
+            interval=interval,
+            fast=fast,
+            slow=slow,
+            fee_bps=fee_bps,
+            risk_cfg=risk_cfg,
+            testnet=args.testnet,
+            testnet_order_qty=testnet_qty,
+            periods_per_year=periods_per_year,
         )
-
-    engine = LiveEngine(
-        portfolio, broker, fast=fast, slow=slow,
-        bootstrap_fn=feed.bootstrap,
-    )
-
-    # Synchronous bootstrap — blocks for ~0.5 s, runs before event loop.
-    bootstrap_bars = feed.bootstrap()
-    engine.initialize(bootstrap_bars)
+        bootstrap_bars = feed.bootstrap()
+        engine.initialize(bootstrap_bars)
+        feed_engine_pairs.append((feed, engine))
+        engines[sym] = engine
 
     mode = "TESTNET" if args.testnet else "PAPER"
+    sym_str = ", ".join(symbols)
     logger.info("=" * 62)
-    logger.info("Live %s session  |  %s %s  |  Press Ctrl+C to stop", mode, symbol, interval)
+    logger.info(
+        "Live %s  |  %s  |  %s  |  Press Ctrl+C to stop",
+        mode, sym_str, interval,
+    )
     logger.info("=" * 62)
 
     try:
-        asyncio.run(_stream(feed, engine))
+        asyncio.run(_stream_all(feed_engine_pairs))
     except KeyboardInterrupt:
         pass
     finally:
-        _print_summary(engine, cfg)
+        _print_summary(engines, cfg)
 
 
 if __name__ == "__main__":

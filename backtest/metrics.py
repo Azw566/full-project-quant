@@ -16,6 +16,17 @@ import pandas as pd
 # bar interval is not daily — e.g. 8760 for 1-hour bars, 252 for daily.
 TRADING_DAYS_PER_YEAR = 252
 
+# Canonical map from Binance candle interval string → periods per year.
+# Single source of truth — import this wherever annualisation is needed.
+PERIODS_PER_YEAR: dict[str, float] = {
+    "1m":  525_600,
+    "5m":  105_120,
+    "15m":  35_040,
+    "1h":   8_760,
+    "4h":   2_190,
+    "1d":     252,
+}
+
 
 def compute_metrics(
     returns: pd.Series,
@@ -76,8 +87,13 @@ def compute_metrics(
 
     total_return = float(equity.iloc[-1] - 1.0)
 
-    years      = n / periods_per_year
-    ann_return = float((1 + total_return) ** (1.0 / years) - 1)
+    years = n / periods_per_year
+    if total_return <= -1.0:
+        # Total wipeout — geometric annualisation would raise a negative base
+        # to a fractional exponent. Clamp to -100% annualised.
+        ann_return = -1.0
+    else:
+        ann_return = float((1 + total_return) ** (1.0 / years) - 1)
 
     ann_vol = float(returns.std(ddof=1) * np.sqrt(periods_per_year))
 

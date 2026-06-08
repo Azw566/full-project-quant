@@ -74,6 +74,7 @@ class TestnetBroker:
     on_order(OrderEvent) → FillEvent signature, no other interface changes.
     LiveEngine works with either broker without modification.
     """
+    __test__ = False  # prevent pytest from treating this as a test class
 
     def __init__(
         self,

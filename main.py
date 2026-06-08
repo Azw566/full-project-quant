@@ -1,25 +1,35 @@
 """
 main.py — Entry point.
 
-Runs both phases in sequence:
+Runs all phases in sequence:
     Phase 0 — data layer verification (reproducibility check)
     Phase 1 — vectorized MA crossover backtest with fees and walk-forward split
+    Phase 2 — event-driven backtester parity check
+    BTC     — same strategy on BTCUSDT hourly (live instrument validation)
+    Phase 6 — multi-asset equal-weight portfolio engine
 
 Usage:
     python main.py
 """
 
 import logging
+import sys
 
+# Ensure UTF-8 output on Windows consoles (cp1252 can't encode Greek/math chars).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+import numpy as np
 import pandas as pd
 import yaml
 
+from backtest.event_driven import run as run_event_driven
+from backtest.metrics import compute_metrics
+from backtest.portfolio import run_portfolio
+from backtest.vectorized import run as run_vectorized
 from data.loader import get_bars
 from feed.binance import get_historical_bars
 from strategy.ma_crossover import generate_signals
-from backtest.vectorized import run as run_vectorized
-from backtest.event_driven import run as run_event_driven
-from backtest.metrics import compute_metrics
 
 logging.basicConfig(
     level=logging.INFO,
@@ -215,6 +225,77 @@ def run_btc_backtest(cfg: dict) -> None:
     print()
 
 
+def run_phase6(cfg: dict, bars: pd.DataFrame) -> None:
+    """
+    Phase 6 — Multi-asset equal-weight portfolio engine.
+
+    Runs the MA crossover strategy on two assets simultaneously:
+      - SPY (the real equity data from Phase 1)
+      - A synthetic "SPY-B": SPY returns + small independent noise
+
+    SPY-B is generated deterministically so results are reproducible.
+    Its purpose is to give the portfolio engine two distinct but correlated
+    assets — exactly the regime where diversification provides partial benefit.
+
+    The key thing to observe: portfolio vol is lower than the average of the
+    two individual vols, even when the assets are correlated. This is the
+    Markowitz free lunch. When assets are fully correlated (ρ=1), the benefit
+    disappears; when uncorrelated (ρ=0), portfolio vol falls to 1/√2 of
+    individual vol.
+    """
+    _print_section("PHASE 6 — Portfolio engine (multi-asset equal weight)")
+
+    bt_cfg  = cfg["backtest"]
+    fast    = bt_cfg["fast_ma"]
+    slow    = bt_cfg["slow_ma"]
+    fee_bps = bt_cfg["fee_bps"]
+
+    # Build SPY-B: SPY daily returns + 30%-of-vol independent noise.
+    rng          = np.random.default_rng(42)
+    spy_returns  = bars["close"].pct_change().dropna()
+    noise        = rng.normal(0.0, spy_returns.std() * 0.3, len(spy_returns))
+    returns_b    = spy_returns.values + noise
+    closes_b     = bars["close"].iloc[0] * np.cumprod(1 + returns_b)
+    bars_b       = bars.copy()
+    bars_b["close"] = np.concatenate([[bars["close"].iloc[0]], closes_b])
+    for col in ("open", "high", "low"):
+        bars_b[col] = bars_b["close"]
+
+    sigs_a = generate_signals(bars,   fast=fast, slow=slow)
+    sigs_b = generate_signals(bars_b, fast=fast, slow=slow)
+
+    assets = {
+        "SPY":   (bars,   sigs_a),
+        "SPY-B": (bars_b, sigs_b),
+    }
+
+    result = run_portfolio(assets, fee_bps=fee_bps)
+
+    ptf_m = result.metrics["portfolio"]
+    a_m   = result.metrics["SPY"]
+    b_m   = result.metrics["SPY-B"]
+
+    print(f"\n  Strategy   : {fast}/{slow}-day MA crossover")
+    print(f"  Fee        : {fee_bps} bps per side")
+    print(f"  Assets     : SPY + SPY-B (equal weight 50/50)")
+    print(f"  SPY-B      : SPY returns + 30%-of-vol independent noise (rho ~ 0.95)")
+    print(f"  Bars       : {len(result.combined)} (inner join)")
+
+    _print_metrics("SPY   (standalone)", a_m)
+    _print_metrics("SPY-B (standalone)", b_m)
+    _print_metrics("PORTFOLIO (equal weight)", ptf_m)
+
+    avg_vol    = (a_m["ann_vol"] + b_m["ann_vol"]) / 2
+    vol_reduc  = 1.0 - ptf_m["ann_vol"] / avg_vol
+    avg_sharpe = (a_m["sharpe"] + b_m["sharpe"]) / 2
+
+    print(f"\n  Vol reduction from diversification : {vol_reduc:+.1%}")
+    print(f"  Portfolio Sharpe : {ptf_m['sharpe']:+.2f}   avg individual : {avg_sharpe:+.2f}")
+    if ptf_m["sharpe"] >= avg_sharpe - 0.05:
+        print("  Diversification maintained or improved risk-adjusted returns.")
+    print()
+
+
 def main() -> None:
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
@@ -225,6 +306,7 @@ def main() -> None:
     run_phase1(cfg, bars)
     run_phase2(cfg, bars)
     run_btc_backtest(cfg)
+    run_phase6(cfg, bars)
 
 
 if __name__ == "__main__":
