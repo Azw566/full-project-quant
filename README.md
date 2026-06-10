@@ -4,54 +4,17 @@ An end-to-end systematic trading system built as a quant-developer learning proj
 The goal is to prove engineering correctness — reproducible data, event-driven backtesting,
 and a single strategy code path that runs unchanged in both backtest and live trading.
 
-## Architecture
-
-```
-         +----------------------------------------------------------+
-         |                        ENGINE                             |
-         |              (the event loop / clock)                     |
-         +----------------------------------------------------------+
-              |            |            |            |
-              v            v            v            v
-        +---------+  +----------+  +-----------+  +-----------+
-        |  DATA   |->| STRATEGY |->| PORTFOLIO |->| EXECUTION |
-        |  feed   |  | (signal) |  |  & risk   |  |  (fills)  |
-        +---------+  +----------+  +-----------+  +-----------+
-              ^                                          |
-              |            BACKTEST: historical file     |
-              +----------  LIVE:     market data feed <--+
-                          (same event types either way)
-```
-
-## Build Phases
-
-| Phase | Goal | Status |
-|-------|------|--------|
-| 0 | Data layer — reproducible OHLCV download and parquet cache | Done |
-| 1 | Vectorized backtest with fees and walk-forward split | Done |
-| 2 | Event-driven backtester (architectural core) | Done |
-| 3 | Live paper data feed — backtest/live parity | Done |
-| 4 | Testnet execution — real market orders via Binance Spot Testnet | Done |
-| 5 | Risk, accounting, and correctness hardening | Done |
-| 6 | Portfolio engine — multi-asset equal-weight runner | Done |
-
 ## Strategies
 
 Switch strategies by changing one line in `config.yaml`:
 
-```yaml
-strategy: ma_crossover   # ← change this
-```
-
-| Key | Description |
-|-----|-------------|
-| `ma_crossover` | Long when fast SMA > slow SMA (trend-following) |
-| `ema_crossover` | Same but uses exponential MAs — reacts faster to recent prices |
-| `rsi` | Long when RSI is oversold, flat when overbought (mean-reversion) |
-| `bollinger_bands` | Long at lower Bollinger Band, flat at upper band (mean-reversion) |
-| `momentum` | Long when price is higher than N bars ago (rate-of-change) |
-| `macd` | Long when MACD line crosses above its signal line |
-| `mean_reversion` | Long when z-score falls below a threshold, flat when it reverts |
+ `ma_crossover` : Long when fast SMA > slow SMA (trend-following) 
+ `ema_crossover` : Same but uses exponential MAs — reacts faster to recent prices 
+ `rsi` : Long when RSI is oversold, flat when overbought (mean-reversion) 
+ `bollinger_bands` : Long at lower Bollinger Band, flat at upper band (mean-reversion)
+ `momentum` : Long when price is higher than N bars ago (rate-of-change) 
+ `macd` : Long when MACD line crosses above its signal line 
+ `mean_reversion` : Long when z-score falls below a threshold, flat when it reverts 
 
 Each strategy's parameters live under `strategies:` in `config.yaml` — no code changes needed.
 
@@ -85,23 +48,7 @@ fullproject/
 │   ├── engine.py            # LiveEngine — online event pipeline (Phase 3)
 │   └── runner.py            # entry point: python live/runner.py [--testnet]
 ├── execution/
-│   └── binance_broker.py    # TestnetBroker — real orders via Binance Spot Testnet (Phase 4)
-├── tests/
-│   ├── test_loader.py
-│   ├── test_vectorized.py
-│   ├── test_event_driven.py
-│   ├── test_live_engine.py
-│   ├── test_testnet_broker.py
-│   ├── test_metrics.py
-│   ├── test_portfolio.py
-│   ├── test_risk.py
-│   └── test_binance_feed.py
-└── notes/
-    ├── phase0_data_layer.txt
-    ├── phase1_vectorized_backtest.txt
-    ├── phase2_event_driven.txt
-    ├── phase3_live_feed.txt
-    └── phase4_testnet.txt
+    └── binance_broker.py    # TestnetBroker — real orders via Binance Spot Testnet (Phase 4)
 ```
 
 ## Quick Start
@@ -117,27 +64,3 @@ Every subsequent run reads from cache — same data, no network call.
 ```bash
 pytest tests/ -v
 ```
-
-## Tech Stack
-
-- **Data**: `yfinance` (Yahoo Finance), cached as `parquet` via `pyarrow`
-- **Analysis**: `pandas`, `numpy`
-- **Config**: `pyyaml`
-- **Testing**: `pytest`
-- **Language**: Python
-
-## Key Concepts
-
-**Look-ahead bias** — using information that wouldn't have existed at decision time.
-The event-driven engine (Phase 2) makes this structurally impossible: signals computed
-at bar T determine the position entered at bar T+1.
-
-**Backtest/live parity** — the North Star. One strategy code path, two data sources.
-The same `_Portfolio` and `_Broker` objects run in both the event-driven backtester
-and the live engine.
-
-**Reproducibility** — same inputs, same outputs. Every backtest traces to a
-frozen, versioned dataset.
-
-**Transaction cost realism** — fees, spread, and slippage are first-class inputs,
-not footnotes. They change conclusions, not just magnitudes.
