@@ -9,14 +9,57 @@ end:    "2024-12-31"   # End of historical window
 data_path: "data/cache"  # Where parquet files are stored on disk
 log_level: "INFO"        # DEBUG for verbose output, INFO for normal use
 
+# ── Strategy selection ────────────────────────────────────────────────────────
+# Set strategy: to any key listed under strategies: below.
+# Available: ma_crossover | ema_crossover | rsi | bollinger_bands | momentum | macd | mean_reversion
+strategy: ma_crossover
+
+# ── Per-strategy parameters ───────────────────────────────────────────────────
+strategies:
+
+  # Simple SMA crossover: long when fast MA > slow MA.
+  ma_crossover:
+    fast: 50
+    slow: 200
+
+  # Exponential MA crossover: same logic but EMAs react faster to recent prices.
+  ema_crossover:
+    fast: 12
+    slow: 26
+
+  # RSI mean-reversion: long when oversold, flat when overbought.
+  rsi:
+    period:     14
+    oversold:   30.0
+    overbought: 70.0
+
+  # Bollinger Bands mean-reversion: long at lower band, flat at upper band.
+  bollinger_bands:
+    period:  20
+    num_std: 2.0
+
+  # Rate-of-change momentum: long when price is higher than N bars ago.
+  momentum:
+    period: 20
+
+  # MACD: long when MACD line crosses above its signal line.
+  macd:
+    fast:          12
+    slow:          26
+    signal_period: 9
+
+  # Z-score mean-reversion: long when price is unusually cheap vs recent history.
+  mean_reversion:
+    period:  20
+    z_entry: 1.5
+    z_exit:  0.5
+
 # ── Phase 3 — Live paper feed ─────────────────────────────────────────────────
 feed:
   symbol:   "BTCUSDT"    # Binance trading pair (no auth needed for market data)
   interval: "1h"         # candle interval: 1m 5m 15m 1h 4h 1d
 
 # ── BTC hourly backtest (validates the live instrument/timescale) ─────────────
-# Uses the same feed.symbol / feed.interval / backtest params.
-# Data is fetched from Binance REST API and cached to data/cache/.
 btc_backtest:
   start: "2022-01-01"
   end:   "2024-12-31"
@@ -24,33 +67,28 @@ btc_backtest:
 # ── Phase 4 — Testnet execution ──────────────────────────────────────────────
 # API key and secret come from environment variables, not this file.
 # Set BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET before using --testnet.
-# Get a free key pair at https://testnet.binance.vision/
 testnet:
   order_qty: 0.001     # BTC quantity per trade (~$40-50 at typical prices)
 
 # ── Phase 1 — Vectorized backtest ────────────────────────────────────────────
 backtest:
-  fast_ma:     50      # Fast moving average window (bars)
-  slow_ma:     200     # Slow moving average window (bars)
+  # fast_ma / slow_ma are used by the live engine (live/engine.py).
+  # Backtest strategy parameters are set under strategies: above.
+  fast_ma:     50      # Fast MA window for live engine
+  slow_ma:     200     # Slow MA window for live engine
   fee_bps:     10.0    # One-way transaction cost (10 bps = 0.10% per trade)
   train_ratio: 0.7     # In-sample fraction; last (1 - ratio) is out-of-sample
 
 # ── Phase 6 — Portfolio (multi-asset live runner) ─────────────────────────────
-# Symbols to trade concurrently when running: python live/runner.py --portfolio
-# Each symbol gets an independent LiveEngine with equal weight in the aggregate.
 portfolio:
   symbols:
     - BTCUSDT
     - ETHUSDT
 
 # ── Phase 5 — Risk management ─────────────────────────────────────────────────
-# All entries are optional. Remove or set to null to disable a feature.
 risk:
-  vol_target:    0.20   # Annualized vol target; position is scaled so portfolio
-                        # realised vol tracks this level. null = no scaling.
-  vol_lookback:  20     # Rolling window (bars) for realised-vol estimate.
-  max_drawdown:  0.15   # Circuit-breaker trigger: go flat when equity falls this
-                        # fraction below its running peak (0.15 = 15% drawdown).
-  cooldown_bars: 20     # Bars to stay flat after circuit fires before re-entering.
-  slippage_bps:  5.0    # Simulated half-spread per trade (one-way, same units
-                        # as fee_bps). Added on top of fee_bps in paper mode.
+  vol_target:    0.20
+  vol_lookback:  20
+  max_drawdown:  0.15
+  cooldown_bars: 20
+  slippage_bps:  5.0

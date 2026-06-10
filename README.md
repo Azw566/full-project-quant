@@ -4,8 +4,6 @@ An end-to-end systematic trading system built as a quant-developer learning proj
 The goal is to prove engineering correctness — reproducible data, event-driven backtesting,
 and a single strategy code path that runs unchanged in both backtest and live trading.
 
-This project is bound to eveolve, testing multiple algorithms and implementations.
-
 ## Architecture
 
 ```
@@ -30,28 +28,56 @@ This project is bound to eveolve, testing multiple algorithms and implementation
 | Phase | Goal | Status |
 |-------|------|--------|
 | 0 | Data layer — reproducible OHLCV download and parquet cache | Done |
-| 1 | Vectorized backtest of a simple strategy with fees | Done |
+| 1 | Vectorized backtest with fees and walk-forward split | Done |
 | 2 | Event-driven backtester (architectural core) | Done |
 | 3 | Live paper data feed — backtest/live parity | Done |
 | 4 | Testnet execution — real market orders via Binance Spot Testnet | Done |
-| 5 | Risk, accounting, and correctness hardening | Next |
-| 6 | Portfolio polish | Planned |
+| 5 | Risk, accounting, and correctness hardening | Done |
+| 6 | Portfolio engine — multi-asset equal-weight runner | Done |
+
+## Strategies
+
+Switch strategies by changing one line in `config.yaml`:
+
+```yaml
+strategy: ma_crossover   # ← change this
+```
+
+| Key | Description |
+|-----|-------------|
+| `ma_crossover` | Long when fast SMA > slow SMA (trend-following) |
+| `ema_crossover` | Same but uses exponential MAs — reacts faster to recent prices |
+| `rsi` | Long when RSI is oversold, flat when overbought (mean-reversion) |
+| `bollinger_bands` | Long at lower Bollinger Band, flat at upper band (mean-reversion) |
+| `momentum` | Long when price is higher than N bars ago (rate-of-change) |
+| `macd` | Long when MACD line crosses above its signal line |
+| `mean_reversion` | Long when z-score falls below a threshold, flat when it reverts |
+
+Each strategy's parameters live under `strategies:` in `config.yaml` — no code changes needed.
 
 ## Project Structure
 
 ```
 fullproject/
-├── config.yaml              # symbol, date range, backtest params — edit here, not in code
-├── main.py                  # entry point (runs Phase 0 + Phase 1)
+├── config.yaml              # single source of truth — strategy selection + all params
+├── main.py                  # entry point (Phases 0-2, BTC validation, Phase 6)
 ├── requirements.txt
 ├── data/
 │   ├── loader.py            # get_bars() — the only public data interface
 │   └── cache/               # parquet files (gitignored)
 ├── strategy/
-│   └── ma_crossover.py      # generate_signals() — 50/200-day MA crossover
+│   ├── __init__.py          # load_strategy(cfg) — config-driven strategy factory
+│   ├── ma_crossover.py      # SMA crossover
+│   ├── ema_crossover.py     # EMA crossover
+│   ├── rsi.py               # RSI threshold with hysteresis
+│   ├── bollinger_bands.py   # Bollinger Band mean-reversion
+│   ├── momentum.py          # Rate-of-change momentum
+│   ├── macd.py              # MACD line vs. signal line
+│   └── mean_reversion.py    # Z-score mean-reversion
 ├── backtest/
 │   ├── vectorized.py        # run() — vectorized backtest engine (Phase 1)
 │   ├── event_driven.py      # run() — event-driven backtest engine (Phase 2)
+│   ├── portfolio.py         # run_portfolio() — multi-asset equal-weight runner (Phase 6)
 │   └── metrics.py           # compute_metrics() — return, vol, Sharpe, drawdown, turnover
 ├── feed/
 │   └── binance.py           # BinanceFeed — REST bootstrap + WebSocket stream (Phase 3)
@@ -61,12 +87,15 @@ fullproject/
 ├── execution/
 │   └── binance_broker.py    # TestnetBroker — real orders via Binance Spot Testnet (Phase 4)
 ├── tests/
-│   ├── test_loader.py       # data layer tests
-│   ├── test_vectorized.py   # backtest engine tests (including look-ahead check)
-│   ├── test_event_driven.py # event-driven engine tests (including parity check)
-│   ├── test_live_engine.py  # live engine tests (including backtest/live parity)
-│   ├── test_testnet_broker.py # testnet broker tests (mocked HTTP)
-│   └── test_metrics.py      # metrics unit tests
+│   ├── test_loader.py
+│   ├── test_vectorized.py
+│   ├── test_event_driven.py
+│   ├── test_live_engine.py
+│   ├── test_testnet_broker.py
+│   ├── test_metrics.py
+│   ├── test_portfolio.py
+│   ├── test_risk.py
+│   └── test_binance_feed.py
 └── notes/
     ├── phase0_data_layer.txt
     ├── phase1_vectorized_backtest.txt
@@ -93,17 +122,19 @@ pytest tests/ -v
 
 - **Data**: `yfinance` (Yahoo Finance), cached as `parquet` via `pyarrow`
 - **Analysis**: `pandas`, `numpy`
-- **Performance metrics**: `empyrical` (Phase 1+)
-- **Portfolio analytics**: `pyfolio` (Phase 1+)
-- **Testing**: `pytest` + `hypothesis` (property-based, Phase 5)
-- **Language**: Python, with a performance-critical component planned in C
+- **Config**: `pyyaml`
+- **Testing**: `pytest`
+- **Language**: Python
 
 ## Key Concepts
 
 **Look-ahead bias** — using information that wouldn't have existed at decision time.
-The event-driven engine (Phase 2) makes this structurally impossible.
+The event-driven engine (Phase 2) makes this structurally impossible: signals computed
+at bar T determine the position entered at bar T+1.
 
-**Backtest/live parity** — the North Star. One strategy, two data sources.
+**Backtest/live parity** — the North Star. One strategy code path, two data sources.
+The same `_Portfolio` and `_Broker` objects run in both the event-driven backtester
+and the live engine.
 
 **Reproducibility** — same inputs, same outputs. Every backtest traces to a
 frozen, versioned dataset.

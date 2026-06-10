@@ -35,8 +35,7 @@ import pandas as pd
 _logger = logging.getLogger(__name__)
 
 
-# ── Events ─────────────────────────────────────────────────────────────────────
-
+# ── Events 
 @dataclass
 class MarketEvent:
     """A new price bar has arrived from the data feed."""
@@ -68,7 +67,7 @@ class FillEvent:
     slippage:  float = 0.0   # half-spread cost (slippage_bps applied to |delta|)
 
 
-# ── Handlers ───────────────────────────────────────────────────────────────────
+# ── Handlers 
 
 class _Portfolio:
     """
@@ -92,14 +91,14 @@ class _Portfolio:
         self.position: float = 0.0
         self.equity:   float = 1.0
 
-        # ── Vol targeting ──────────────────────────────────────────────────────
+        # Vol targeting
         self._vol_target       = vol_target
         self._vol_lookback     = vol_lookback
         self._periods_per_year = periods_per_year
         # Filled with market_return values in on_fill(); used to estimate vol.
         self._market_returns: deque[float] = deque(maxlen=vol_lookback)
 
-        # ── Circuit breaker ────────────────────────────────────────────────────
+        # Circuit breaker 
         self._max_drawdown    = max_drawdown
         self._cooldown_bars   = cooldown_bars
         self._peak_equity     = 1.0
@@ -116,7 +115,7 @@ class _Portfolio:
         """
         target = event.target_position
 
-        # ── Circuit breaker ────────────────────────────────────────────────────
+        # Circuit breaker 
         if self._max_drawdown is not None:
             self._peak_equity = max(self._peak_equity, self.equity)
             drawdown = self.equity / self._peak_equity - 1.0
@@ -140,7 +139,7 @@ class _Portfolio:
             if self._halted:
                 target = 0.0
 
-        # ── Vol targeting (only when not halted and window is full) ────────────
+        #  Vol targeting (only when not halted and window is full) 
         if not self._halted and self._vol_target is not None:
             if len(self._market_returns) == self._vol_lookback:
                 realized_vol = (
@@ -200,8 +199,7 @@ class _Broker:
         )
 
 
-# ── Public run() ───────────────────────────────────────────────────────────────
-
+# Public run()
 def run(
     bars:             pd.DataFrame,
     signals:          pd.Series,
@@ -230,16 +228,11 @@ def run(
     -------
     pd.DataFrame with columns: position, market_return, gross_return,
         fee, slippage, net_return, equity.
-
-    1-BAR SIGNAL LAG
-    ────────────────
-    The signal from bar T determines the position held on bar T+1.
     """
     # Apply the 1-bar lag: lagged_signals[T] = signals[T-1].
     # The position held on bar T was decided by the signal from bar T-1.
     lagged_signals = signals.shift(1)
 
-    # Drop warmup rows where the lagged signal is still NaN.
     mask           = lagged_signals.notna()
     lagged_signals = lagged_signals[mask].astype(float)
     bars_clean     = bars.loc[mask]
@@ -267,20 +260,20 @@ def run(
             prev_close = close
             continue
 
-        # ── MarketEvent ───────────────────────────────────────────────────────
+        # ── MarketEvent 
         market_return = close / prev_close - 1.0
         market_evt = MarketEvent(timestamp=ts, close=close, market_return=market_return)
 
-        # ── SignalEvent ───────────────────────────────────────────────────────
+        # ── SignalEvent
         signal_evt = SignalEvent(timestamp=ts, target_position=float(lagged_signals.loc[ts]))
 
-        # ── OrderEvent ────────────────────────────────────────────────────────
+        # ── OrderEvent 
         order_evt = portfolio.on_signal(signal_evt)
 
-        # ── FillEvent ─────────────────────────────────────────────────────────
+        # ── FillEvent 
         fill_evt = broker.on_order(order_evt)
 
-        # ── Portfolio update ──────────────────────────────────────────────────
+        # ── Portfolio update 
         row = portfolio.on_fill(fill_evt, market_evt.market_return)
         rows.append(row)
 
