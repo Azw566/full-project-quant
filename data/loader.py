@@ -102,3 +102,21 @@ def get_bars(
     logger.info("Saved → %s  (%d rows)", cache_path, len(raw))
 
     return raw
+
+
+def get_panel(
+    symbols: list[str],
+    start: str,
+    end: str,
+    cache_dir: str = "data/cache",
+) -> pd.DataFrame:
+    """
+    Return a panel of daily close prices for multiple symbols.
+
+    Columns = symbol names, index = DatetimeIndex of common trading dates.
+    Rows with any NaN are dropped so all assets share the same date range.
+    Each symbol is cached individually via get_bars(), so partial fetches
+    are still cached and a single missing symbol won't invalidate others.
+    """
+    closes = {s: get_bars(s, start, end, cache_dir)["close"] for s in symbols}
+    return pd.DataFrame(closes).dropna()
