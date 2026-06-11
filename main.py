@@ -29,7 +29,7 @@ from backtest.portfolio import run_portfolio
 from backtest.vectorized import run as run_vectorized
 from data.loader import get_bars
 from feed.binance import get_historical_bars
-from strategy.ma_crossover import generate_signals
+from strategy import load_strategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,17 +69,14 @@ def run_phase0(cfg: dict) -> None:
     print(f"\n  {status} Reproducibility check (both calls identical)")
 
 
-def run_phase1(cfg: dict, bars: pd.DataFrame) -> None:
-    _print_section("PHASE 1 — Vectorized backtest (MA crossover)")
+def run_phase1(cfg: dict, bars: pd.DataFrame, strategy_fn) -> None:
+    _print_section("PHASE 1 — Vectorized backtest")
 
     bt_cfg      = cfg["backtest"]
-    fast        = bt_cfg["fast_ma"]
-    slow        = bt_cfg["slow_ma"]
     fee_bps     = bt_cfg["fee_bps"]
     train_ratio = bt_cfg["train_ratio"]
 
-    # ── Signal generation ──────────────────────────────────────────────────
-    signals = generate_signals(bars, fast=fast, slow=slow)
+    signals = strategy_fn(bars)
 
     # ── Walk-forward split ─────────────────────────────────────────────────
     # Split the price data, then backtest each half independently.
@@ -93,7 +90,7 @@ def run_phase1(cfg: dict, bars: pd.DataFrame) -> None:
     train_signals = signals.iloc[:n_train]
     oos_signals   = signals.iloc[n_train:]
 
-    print(f"\n  Strategy   : {fast}/{slow}-day MA crossover")
+    print(f"\n  Strategy   : {cfg.get('strategy', 'ma_crossover')}")
     print(f"  Fee        : {fee_bps} bps per side")
     print(f"  In-sample  : {train_bars.index[0].date()}  ->  {train_bars.index[-1].date()}  ({n_train} bars)")
     print(f"  OOS        : {oos_bars.index[0].date()}  ->  {oos_bars.index[-1].date()}  ({n_total - n_train} bars)")
@@ -123,15 +120,13 @@ def run_phase1(cfg: dict, bars: pd.DataFrame) -> None:
     print("  (This is expected for a simple rule — the system design is the goal, not the alpha.)\n")
 
 
-def run_phase2(cfg: dict, bars: pd.DataFrame) -> None:
+def run_phase2(cfg: dict, bars: pd.DataFrame, strategy_fn) -> None:
     _print_section("PHASE 2 — Event-driven backtest (parity check vs Phase 1)")
 
     bt_cfg  = cfg["backtest"]
-    fast    = bt_cfg["fast_ma"]
-    slow    = bt_cfg["slow_ma"]
     fee_bps = bt_cfg["fee_bps"]
 
-    signals = generate_signals(bars, fast=fast, slow=slow)
+    signals = strategy_fn(bars)
 
     vec_result = run_vectorized(bars, signals, fee_bps=fee_bps)
     evt_result = run_event_driven(bars, signals, fee_bps=fee_bps)
@@ -161,7 +156,7 @@ def run_phase2(cfg: dict, bars: pd.DataFrame) -> None:
     print()
 
 
-def run_btc_backtest(cfg: dict) -> None:
+def run_btc_backtest(cfg: dict, strategy_fn) -> None:
     """
     Run the same MA crossover strategy on BTCUSDT hourly data.
 
@@ -183,14 +178,12 @@ def run_btc_backtest(cfg: dict) -> None:
     interval    = feed_cfg["interval"]  # 1h
     start       = btc_cfg.get("start", "2022-01-01")
     end         = btc_cfg.get("end",   "2024-12-31")
-    fast        = bt_cfg["fast_ma"]
-    slow        = bt_cfg["slow_ma"]
     fee_bps     = bt_cfg["fee_bps"]
     train_ratio = bt_cfg["train_ratio"]
 
     cache_file = f"{cfg['data_path']}/{symbol}_{interval}.parquet"
     bars       = get_historical_bars(symbol, interval, start, end, cache_path=cache_file)
-    signals    = generate_signals(bars, fast=fast, slow=slow)
+    signals    = strategy_fn(bars)
 
     n_total = len(bars)
     n_train = int(n_total * train_ratio)
@@ -201,7 +194,7 @@ def run_btc_backtest(cfg: dict) -> None:
     oos_signals   = signals.iloc[n_train:]
 
     print(f"\n  Instrument : {symbol} ({interval} candles)")
-    print(f"  Strategy   : {fast}/{slow}-bar MA crossover")
+    print(f"  Strategy   : {cfg.get('strategy', 'ma_crossover')}")
     print(f"  Fee        : {fee_bps} bps per side")
     print(f"  Period     : {bars.index[0]}  ->  {bars.index[-1]}  ({n_total} bars)")
     print(f"  In-sample  : {train_bars.index[0]}  ->  {train_bars.index[-1]}")
@@ -225,7 +218,7 @@ def run_btc_backtest(cfg: dict) -> None:
     print()
 
 
-def run_phase6(cfg: dict, bars: pd.DataFrame) -> None:
+def run_phase6(cfg: dict, bars: pd.DataFrame, strategy_fn) -> None:
     """
     Phase 6 — Multi-asset equal-weight portfolio engine.
 
@@ -246,8 +239,6 @@ def run_phase6(cfg: dict, bars: pd.DataFrame) -> None:
     _print_section("PHASE 6 — Portfolio engine (multi-asset equal weight)")
 
     bt_cfg  = cfg["backtest"]
-    fast    = bt_cfg["fast_ma"]
-    slow    = bt_cfg["slow_ma"]
     fee_bps = bt_cfg["fee_bps"]
 
     # Build SPY-B: SPY daily returns + 30%-of-vol independent noise.
@@ -261,8 +252,8 @@ def run_phase6(cfg: dict, bars: pd.DataFrame) -> None:
     for col in ("open", "high", "low"):
         bars_b[col] = bars_b["close"]
 
-    sigs_a = generate_signals(bars,   fast=fast, slow=slow)
-    sigs_b = generate_signals(bars_b, fast=fast, slow=slow)
+    sigs_a = strategy_fn(bars)
+    sigs_b = strategy_fn(bars_b)
 
     assets = {
         "SPY":   (bars,   sigs_a),
@@ -275,7 +266,7 @@ def run_phase6(cfg: dict, bars: pd.DataFrame) -> None:
     a_m   = result.metrics["SPY"]
     b_m   = result.metrics["SPY-B"]
 
-    print(f"\n  Strategy   : {fast}/{slow}-day MA crossover")
+    print(f"\n  Strategy   : {cfg.get('strategy', 'ma_crossover')}")
     print(f"  Fee        : {fee_bps} bps per side")
     print(f"  Assets     : SPY + SPY-B (equal weight 50/50)")
     print(f"  SPY-B      : SPY returns + 30%-of-vol independent noise (rho ~ 0.95)")
@@ -300,13 +291,14 @@ def main() -> None:
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
 
-    bars = get_bars(cfg["symbol"], cfg["start"], cfg["end"], cfg["data_path"])
+    bars        = get_bars(cfg["symbol"], cfg["start"], cfg["end"], cfg["data_path"])
+    strategy_fn = load_strategy(cfg)
 
     run_phase0(cfg)
-    run_phase1(cfg, bars)
-    run_phase2(cfg, bars)
-    run_btc_backtest(cfg)
-    run_phase6(cfg, bars)
+    run_phase1(cfg, bars, strategy_fn)
+    run_phase2(cfg, bars, strategy_fn)
+    run_btc_backtest(cfg, strategy_fn)
+    run_phase6(cfg, bars, strategy_fn)
 
 
 if __name__ == "__main__":

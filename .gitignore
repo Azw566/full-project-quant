@@ -17,5 +17,3 @@ data/cache/*.parquet
 .DS_Store
 Thumbs.db
 
-# Personal notes
-GUIDE.md
